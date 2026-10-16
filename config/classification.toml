@@ -1,0 +1,211 @@
+blocklist = [
+  ".wmv",
+  ".wma",
+  ".z",
+  "childporn",
+  "cjhildporn",
+  "child porn",
+  "pedo",
+  "1yo",
+  "2yo",
+  "3yo",
+  "4yo",
+  "5yo",
+  "6yo",
+  "7yo",
+  "8yo",
+  "9yo",
+  "10yo",
+  "11yo",
+  "12yo",
+  "13yo",
+  "14yo",
+  "15yo",
+  "16yo",
+  "17yo",
+  "jailbait",
+  "tetitas",
+  "masha",
+  "marsha",
+  "mafiasex",
+  "pedoman",
+  "pedowoman",
+  "kidcam",
+  "hebefilia",
+  "bebefilia",
+  "videoangels",
+  "hussyfan",
+  "kiddyfuck",
+  "hardcandy",
+  "pedo",
+  "childlover",
+  "ped0",
+  "pedofilia",
+  "pedofila",
+  "petite",
+  "rape",
+  "preteen",
+  "preteens",
+  "preteenz",
+  "lolita",
+  "lolli",
+  "mashaworld",
+  "lolitas",
+  "eurololita",
+  "eurololitas",
+  "rape",
+  "Nymphets",
+  "Nephrene",
+  "babyshivid",
+  "pedofilo",
+  "kiddy",
+  "hairless",
+  "incest",
+  "incesto",
+  "lolifuck",
+  "lolimania",
+  "infant",
+  "diaper",
+  "pedomother",
+  "pedodad",
+  "pedomom",
+  "pedofather",
+  "pedosister",
+  "pedobrother",
+  "daddaughter",
+  "pedoland",
+  "ninas",
+  "nenas",
+  "bebitas",
+  "pornokid",
+  "pornokind",
+  "kinderporn",
+  "kinderfiker",
+  "kinderficker",
+  "littlegirl",
+  "littleboy",
+  "kid sex",
+  "kids sex",
+  "underage",
+  "lolitabay",
+  "pornololita",
+  "pornololitas",
+  "1y",
+  "2y",
+  "3y",
+  "4y",
+  "5y",
+  "6y ",
+  "7y",
+  "8y",
+  "9y",
+  "10y",
+  "11y",
+  "12y",
+  "13y",
+  "14y",
+  "15y",
+  "16y",
+  "17y",
+  "nablot",
+  "1años",
+  "2años",
+  "3años",
+  "4años",
+  "5años",
+  "6años",
+  "7años",
+  "8años",
+  "9años",
+  "10años",
+  "11años",
+  "12años",
+  "13años",
+  "14años",
+  "15años",
+  "16años",
+  "17años",
+  "1yrs",
+  "2yrs",
+  "3yrs",
+  "4yrs",
+  "5yrs",
+  "6yrs",
+  "7yrs",
+  "8yrs",
+  "9yrs",
+  "10yrs",
+  "11yrs",
+  "12yrs",
+  "13yrs",
+  "14yrs",
+  "15yrs",
+  "16yrs",
+  "17yrs",
+]
+
+[formats]
+audio = ["aa", "aac", "aax", "act", "aiff", "amr", "ape", "au", "awb", "dct", "dss", "dvf", "flac", "gsm", "iklax", "ivs", "m4a", "m4b", "mmf", "mp3", "mpc", "msv", "ogg", "opus", "raw", "sln", "tta", "vox", "wav", "wma", "wv"]
+document = ["cbr", "cbz", "cb7", "cbt", "cba", "djvu", "epub", "fb2", "ibook", "azw", "lit", "prc", "mobi", "pdb", "pdb", "oxps", "xps"]
+software = ["exe", "apk", "bat", "bin", "cgi", "gadget", "jar", "py", "ws", "vb", "swift", "sh", "java", "cs", "cpp", "class"]
+video = ["3g2", "3gp", "amv", "asf", "avi", "drc", "f4a", "f4b", "f4p", "f4v", "flv", "gif", "gifv", "m2v", "m4p", "m4v", "mkv", "mng", "mov", "mp2", "mp4", "mpe", "mpeg", "mpg", "mpv", "mxf", "net", "nsv", "ogv", "qt", "rm", "rmvb", "roq", "svi", "vob", "webm", "wmv", "yuv"]
+
+[[tags]]
+type = "video"
+includes = "1080"
+tag = "1080"
+
+[[tags]]
+type = "video"
+includes = "720"
+tag = "720"
+
+[[tags]]
+type = "video"
+includes = "bdrip"
+tag = "bdrip"
+
+[[tags]]
+type = "video"
+includes = "dvdrip"
+tag = "dvdrip"
+
+[[tags]]
+type = "video"
+includes = "hd"
+tag = "hd"
+
+[[tags]]
+type = "video"
+includes = "sd"
+tag = "sd"
+
+[[tags]]
+type = "video"
+includes = "xxx"
+tag = "xxx"
+
+[[tags]]
+type = "doc"
+includes = "azw3"
+tag = "kindle"
+
+[[tags]]
+type = "doc"
+includes = "epub"
+tag = "epub"
+
+[[tags]]
+type = "doc"
+includes = "mobi"
+tag = "mobi"
+
+[[tags]]
+type = "video"
+regex = "(?i)season|episode|s[0-9]{2}e[0-9]{2}"
+tag = "show"
+
+[[tags]]
+type = "video"
+regex = "(?i)[0-9]+x[0-9]+"
+tag = "show"

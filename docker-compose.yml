@@ -1,0 +1,33 @@
+services:
+  bt-scraper:
+    build: .
+    ports:
+      - "8080:8080"
+      - "6881:6881/udp"
+    volumes:
+      - ./data:/data
+    environment:
+      RUST_LOG: bt_scraper=info
+    command: ["run", "--config", "/data/config.toml"]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bt_scraper
+      POSTGRES_PASSWORD: bt_scraper
+      POSTGRES_DB: bt_scraper
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    ports:
+      - "7700:7700"
+    volumes:
+      - meili:/meili_data
+
+volumes:
+  pgdata:
+  meili:

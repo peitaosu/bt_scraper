@@ -1,0 +1,77 @@
+use crate::InfoHash;
+use std::collections::VecDeque;
+
+const DEFAULT_MAX: usize = 2000;
+const DEFAULT_INTERVAL_SECS: u64 = 60;
+const MAX_SAMPLE_REPLY: usize = 20;
+
+pub struct SampleStore {
+    hashes: VecDeque<InfoHash>,
+    max: usize,
+    interval_secs: u64,
+}
+
+impl SampleStore {
+    pub fn new(max: usize) -> Self {
+        Self {
+            hashes: VecDeque::new(),
+            max: max.max(1),
+            interval_secs: DEFAULT_INTERVAL_SECS,
+        }
+    }
+
+    pub fn default_cap() -> Self {
+        Self::new(DEFAULT_MAX)
+    }
+
+    pub fn record(&mut self, info_hash: InfoHash) {
+        if self.hashes.iter().any(|existing| existing == &info_hash) {
+            return;
+        }
+        if self.hashes.len() >= self.max {
+            self.hashes.pop_front();
+        }
+        self.hashes.push_back(info_hash);
+    }
+
+    pub fn count(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn interval_secs(&self) -> u64 {
+        self.interval_secs
+    }
+
+    pub fn random_sample(&self, limit: usize) -> Vec<InfoHash> {
+        let limit = limit.min(MAX_SAMPLE_REPLY).min(self.hashes.len());
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut indices: Vec<usize> = (0..self.hashes.len()).collect();
+        for slot in 0..limit {
+            let swap_with = rand::random::<usize>() % self.hashes.len();
+            indices.swap(slot, swap_with);
+        }
+        indices
+            .into_iter()
+            .take(limit)
+            .filter_map(|index| self.hashes.get(index).copied())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_and_samples_unique_hashes() {
+        let mut store = SampleStore::new(4);
+        for i in 0u8..6 {
+            store.record(InfoHash([i; 20]));
+        }
+        assert_eq!(store.count(), 4);
+        let sample = store.random_sample(2);
+        assert_eq!(sample.len(), 2);
+    }
+}

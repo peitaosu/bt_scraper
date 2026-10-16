@@ -1,0 +1,76 @@
+[dht]
+bind = "0.0.0.0:6881"
+bootstrap = ["router.bittorrent.com:6881", "dht.transmissionbt.com:6881"]
+bep51_interval_secs = 5
+bep51_batch = 100
+bep51_concurrency = 16
+find_node_burst_interval_secs = 30
+find_node_burst_size = 20
+routing_table_path = "data/routing.json"
+routing_save_interval_secs = 300
+
+[enrichment]
+concurrency = 256
+queue_capacity = 100000
+peers_per_hash = 8
+peer_timeout_secs = 15
+retry_base_secs = 30
+retry_max_secs = 21600
+retry_max_attempts = 12
+    retry_poll_interval_secs = 30
+    scheduler_batch = 32
+    failed_retry_after_secs = 604800
+discovery_batch_size = 256
+discovery_flush_ms = 50
+
+[tracker]
+peers = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.tracker.cl:1337/announce",
+    "http://tracker.opentrackr.org:1337/announce",
+    "https://tracker.opentrackr.org:1337/announce",
+]
+scrape_urls = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.tracker.cl:1337/announce",
+]
+scrape_interval_secs = 300
+scrape_batch = 100
+scrape_timeout_secs = 5
+scrape_stale_secs = 300
+
+[store]
+path = "data/torrents.db"
+peer_ttl_secs = 86400
+write_batch_size = 64
+write_flush_ms = 25
+
+[index]
+path = "data/search"
+batch_size = 100
+poll_interval_secs = 10
+commit_batch = 50
+
+[search]
+default_limit = 20
+max_limit = 100
+default_sort = "seeders"
+
+[metrics]
+enabled = true
+
+[classification]
+config_path = "config/classification.toml"
+
+[postgres]
+enabled = false
+url = "postgres://bt_scraper:bt_scraper@localhost/bt_scraper"
+
+[meilisearch]
+enabled = false
+url = "http://127.0.0.1:7700"
+api_key = ""
+index = "torrents"
+
+[api]
+bind = "0.0.0.0:8080"
