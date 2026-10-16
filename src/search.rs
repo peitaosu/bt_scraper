@@ -13,6 +13,8 @@ const SCHEMA_VERSION: &str = "2";
 pub struct SearchIndex {
     index: Index,
     reader: Arc<RwLock<IndexReader>>,
+    writer: Arc<RwLock<IndexWriter>>,
+    reload_on_commit: bool,
     schema: Schema,
     info_hash_field: Field,
     name_field: Field,
@@ -57,6 +59,14 @@ pub struct SearchResult {
 
 impl SearchIndex {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, 50, true)
+    }
+
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        writer_heap_mb: usize,
+        reload_on_commit: bool,
+    ) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -94,9 +104,14 @@ impl SearchIndex {
         let leechers_field = schema.get_field("leechers").unwrap();
         let enriched_at_field = schema.get_field("enriched_at").unwrap();
         let discovered_at_field = schema.get_field("discovered_at").unwrap();
+        let writer = index
+            .writer(writer_heap_mb.max(1) * 1_000_000)
+            .context("open index writer")?;
         Ok(Self {
             index,
             reader: Arc::new(RwLock::new(reader)),
+            writer: Arc::new(RwLock::new(writer)),
+            reload_on_commit,
             schema,
             info_hash_field,
             name_field,
@@ -111,10 +126,29 @@ impl SearchIndex {
         })
     }
 
-    pub fn writer(&self) -> Result<IndexWriter> {
-        self.index
-            .writer(50_000_000)
-            .context("open index writer")
+    pub fn with_writer<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut IndexWriter) -> Result<T>,
+    {
+        let mut writer = self
+            .writer
+            .write()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        f(&mut writer)
+    }
+
+    pub fn commit_if_needed(&self, pending: &mut usize, commit_batch: usize) -> Result<()> {
+        if *pending >= commit_batch {
+            self.with_writer(|writer| {
+                writer.commit()?;
+                Ok(())
+            })?;
+            if self.reload_on_commit {
+                self.reload()?;
+            }
+            *pending = 0;
+        }
+        Ok(())
     }
 
     pub fn reload(&self) -> Result<()> {
@@ -154,6 +188,65 @@ impl SearchIndex {
         );
         writer.add_document(document)?;
         Ok(())
+    }
+
+    pub fn update_swarm_stats(
+        &self,
+        info_hash: &InfoHash,
+        seeders: u64,
+        leechers: u64,
+    ) -> Result<bool> {
+        let reader = self
+            .reader
+            .read()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .clone();
+        let searcher = reader.searcher();
+        let term = Term::from_field_text(self.info_hash_field, &info_hash.to_hex());
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let top_docs = searcher.search(
+            &query,
+            &TopDocs::with_limit(1).order_by_score(),
+        )?;
+        let Some((_score, doc_address)) = top_docs.into_iter().next() else {
+            return Ok(false);
+        };
+        let retrieved: TantivyDocument = searcher.doc(doc_address)?;
+        let name = field_str(&retrieved, self.name_field);
+        let files = field_str(&retrieved, self.files_field);
+        let content_type = field_str(&retrieved, self.content_type_field);
+        let tags = field_str(&retrieved, self.tags_field);
+        let total_length = retrieved
+            .get_first(self.total_length_field)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let enriched_at = retrieved
+            .get_first(self.enriched_at_field)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let discovered_at = retrieved
+            .get_first(self.discovered_at_field)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        self.with_writer(|writer| {
+            let term = Term::from_field_text(self.info_hash_field, &info_hash.to_hex());
+            writer.delete_term(term);
+            let document = doc!(
+                self.info_hash_field => info_hash.to_hex(),
+                self.name_field => name,
+                self.files_field => files,
+                self.content_type_field => content_type,
+                self.tags_field => tags,
+                self.total_length_field => total_length,
+                self.seeders_field => seeders,
+                self.leechers_field => leechers,
+                self.enriched_at_field => enriched_at,
+                self.discovered_at_field => discovered_at,
+            );
+            writer.add_document(document)?;
+            Ok(())
+        })?;
+        Ok(true)
     }
 
     pub fn search(&self, query: &SearchQuery) -> Result<SearchResult> {
@@ -279,6 +372,14 @@ impl SearchIndex {
     }
 }
 
+fn field_str(document: &TantivyDocument, field: Field) -> String {
+    document
+        .get_first(field)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn build_schema() -> Schema {
     let mut builder = Schema::builder();
     builder.add_text_field("info_hash", STRING | STORED);
@@ -396,7 +497,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let search = SearchIndex::open(dir.path()).unwrap();
         let rules = ClassificationRules::load("config/classification.toml").unwrap();
-        let mut writer = search.writer().unwrap();
         let hash = InfoHash([1u8; 20]);
         let metadata = TorrentMetadata {
             name: "Ubuntu Desktop 22.04".into(),
@@ -405,18 +505,21 @@ mod tests {
         };
         let classification = classify(&metadata, &rules);
         search
-            .upsert(
-                &mut writer,
-                &hash,
-                &metadata,
-                &classification,
-                10,
-                2,
-                1_700_000_000,
-                1_699_999_000,
-            )
+            .with_writer(|writer| {
+                search.upsert(
+                    writer,
+                    &hash,
+                    &metadata,
+                    &classification,
+                    10,
+                    2,
+                    1_700_000_000,
+                    1_699_999_000,
+                )?;
+                writer.commit()?;
+                Ok(())
+            })
             .unwrap();
-        writer.commit().unwrap();
         search.reload().unwrap();
 
         let result = search
@@ -439,34 +542,35 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let search = SearchIndex::open(dir.path()).unwrap();
         let rules = ClassificationRules::load("config/classification.toml").unwrap();
-        let mut writer = search.writer().unwrap();
-
         let low = InfoHash([30u8; 20]);
         let high = InfoHash([31u8; 20]);
-        for (hash, name, seeders) in [
-            (low, "low-seeders", 2u64),
-            (high, "high-seeders", 50u64),
-        ] {
-            let metadata = TorrentMetadata {
-                name: name.into(),
-                files: vec![],
-                total_length: 100,
-            };
-            let classification = classify(&metadata, &rules);
-            search
-                .upsert(
-                    &mut writer,
-                    &hash,
-                    &metadata,
-                    &classification,
-                    seeders,
-                    1,
-                    1_700_000_000,
-                    1_699_999_000,
-                )
-                .unwrap();
-        }
-        writer.commit().unwrap();
+        search
+            .with_writer(|writer| {
+                for (hash, name, seeders) in [
+                    (low, "low-seeders", 2u64),
+                    (high, "high-seeders", 50u64),
+                ] {
+                    let metadata = TorrentMetadata {
+                        name: name.into(),
+                        files: vec![],
+                        total_length: 100,
+                    };
+                    let classification = classify(&metadata, &rules);
+                    search.upsert(
+                        writer,
+                        &hash,
+                        &metadata,
+                        &classification,
+                        seeders,
+                        1,
+                        1_700_000_000,
+                        1_699_999_000,
+                    )?;
+                }
+                writer.commit()?;
+                Ok(())
+            })
+            .unwrap();
         search.reload().unwrap();
 
         let result = search

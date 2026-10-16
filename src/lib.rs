@@ -8,6 +8,7 @@ pub mod config;
 pub mod dht;
 pub mod domain;
 pub mod enrich;
+pub mod infra;
 pub mod workers;
 pub mod metrics;
 pub mod peer_policy;

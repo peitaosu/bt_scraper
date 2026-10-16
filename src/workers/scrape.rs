@@ -1,6 +1,7 @@
 use crate::config::TrackerConfig;
+use crate::infra::TrackerGateway;
+use crate::search::SearchIndex;
 use crate::store::Store;
-use crate::tracker::scrape_counts;
 use crate::unix_now;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,7 +11,10 @@ use tracing::{debug, warn};
 
 pub async fn run_tracker_scrape_loop(
     store: Arc<Store>,
+    search: Arc<SearchIndex>,
+    trackers: Arc<TrackerGateway>,
     config: TrackerConfig,
+    patch_swarm_on_scrape: bool,
     cancel: CancellationToken,
 ) {
     let timeout = Duration::from_secs(config.scrape_timeout_secs);
@@ -44,10 +48,14 @@ pub async fn run_tracker_scrape_loop(
 
         let mut merged: HashMap<crate::InfoHash, (u32, u32)> = HashMap::new();
         let mut set = tokio::task::JoinSet::new();
-        for tracker_url in &scrape_urls {
-            let tracker_url = tracker_url.clone();
+        for tracker_url in scrape_urls.clone() {
+            let trackers = trackers.clone();
             let candidates = candidates.clone();
-            set.spawn(async move { scrape_counts(&tracker_url, &candidates, timeout).await });
+            set.spawn(async move {
+                trackers
+                    .scrape_counts(&tracker_url, &candidates, timeout)
+                    .await
+            });
         }
         while let Some(result) = set.join_next().await {
             match result {
@@ -81,8 +89,31 @@ pub async fn run_tracker_scrape_loop(
                 (*hash, seeders, leechers, now)
             })
             .collect();
-        if let Err(error) = store.update_tracker_stats_batch(updates).await {
+        if let Err(error) = store.update_tracker_stats_batch(updates.clone()).await {
             warn!(%error, "batch tracker stats update failed");
+        }
+
+        if patch_swarm_on_scrape {
+            let search_patch = search.clone();
+            let patch_updates = updates;
+            let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                for (hash, seeders, leechers, _) in patch_updates {
+                    if let Err(error) = search_patch.update_swarm_stats(
+                        &hash,
+                        seeders as u64,
+                        leechers as u64,
+                    ) {
+                        debug!(%error, "tantivy swarm patch failed");
+                    }
+                }
+                search_patch.with_writer(|writer| {
+                    writer.commit()?;
+                    Ok(())
+                })?;
+                search_patch.reload()?;
+                Ok(())
+            })
+            .await;
         }
 
         metrics::counter!("scrape_batch_total").increment(1);

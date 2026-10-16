@@ -1,11 +1,21 @@
 use anyhow::{Context, Result, bail};
+use crate::infra::{DnsCache, SharedHttp, UdpPool};
 use crate::{InfoHash, Peer, PeerSource};
 use rand::Rng;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use url::Url;
+
+const UDP_SESSION_TTL: Duration = Duration::from_secs(50);
+
+fn udp_tracker_sessions() -> &'static Mutex<HashMap<SocketAddr, (u64, Instant)>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<SocketAddr, (u64, Instant)>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 const CONNECT: u32 = 0;
 const ANNOUNCE: u32 = 1;
@@ -15,15 +25,18 @@ const ANNOUNCE_RESPONSE_HEADER_LEN: usize = 20;
 const CONNECT_RESPONSE_LEN: usize = 16;
 const CONNECT_MAGIC: u64 = 0x41727101980;
 
-pub async fn fetch_peers(
+pub async fn fetch_peers_with(
     tracker_url: &str,
     info_hash: &InfoHash,
     timeout_duration: Duration,
+    http: &SharedHttp,
+    udp: &UdpPool,
+    dns: &DnsCache,
 ) -> Result<Vec<Peer>> {
     let url = Url::parse(tracker_url).context("parse tracker url")?;
     match url.scheme() {
-        "http" | "https" => fetch_peers_http(&url, info_hash, timeout_duration).await,
-        _ => fetch_peers_udp(tracker_url, info_hash, timeout_duration).await,
+        "http" | "https" => fetch_peers_http(&url, info_hash, timeout_duration, http).await,
+        _ => fetch_peers_udp(tracker_url, info_hash, timeout_duration, udp, dns).await,
     }
 }
 
@@ -31,11 +44,14 @@ async fn fetch_peers_udp(
     tracker_url: &str,
     info_hash: &InfoHash,
     timeout_duration: Duration,
+    udp: &UdpPool,
+    dns: &DnsCache,
 ) -> Result<Vec<Peer>> {
     let (host, port) = parse_tracker(tracker_url)?;
-    let addr = resolve_tracker_addr(&host, port)?;
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let connection_id = udp_connect(&socket, addr, timeout_duration).await?;
+    let addr = dns.resolve_tracker_v4(&host, port)?;
+    let lease = udp.acquire().await?;
+    let socket = &lease.socket;
+    let connection_id = udp_connection_id(socket, addr, timeout_duration).await?;
     let announce_tx = random_transaction_id();
     let announce = build_announce(connection_id, info_hash, announce_tx);
     socket.send_to(&announce, addr).await?;
@@ -54,11 +70,15 @@ async fn fetch_peers_http(
     url: &Url,
     info_hash: &InfoHash,
     timeout_duration: Duration,
+    http: &SharedHttp,
 ) -> Result<Vec<Peer>> {
     let peer_id = tracker_peer_id();
     let announce_url = build_http_announce_url(url, info_hash, &peer_id)?;
-    let client = reqwest::Client::new();
-    let response = timeout(timeout_duration, client.get(announce_url).send()).await??;
+    let response = timeout(
+        timeout_duration,
+        http.client().get(announce_url).send(),
+    )
+    .await??;
     let body = response.bytes().await?;
     parse_http_announce_peers(&body)
 }
@@ -108,18 +128,23 @@ fn parse_http_announce_peers(body: &[u8]) -> Result<Vec<Peer>> {
     Ok(peers)
 }
 
-pub async fn scrape_counts(
+pub async fn scrape_counts_with(
     tracker_url: &str,
     info_hashes: &[InfoHash],
     timeout_duration: Duration,
+    http: &SharedHttp,
+    udp: &UdpPool,
+    dns: &DnsCache,
 ) -> Result<Vec<(InfoHash, u32, u32)>> {
     if info_hashes.is_empty() {
         return Ok(Vec::new());
     }
     let url = Url::parse(tracker_url).context("parse tracker url")?;
     match url.scheme() {
-        "http" | "https" => scrape_counts_http(&url, info_hashes, timeout_duration).await,
-        _ => scrape_counts_udp(tracker_url, info_hashes, timeout_duration).await,
+        "http" | "https" => {
+            scrape_counts_http(&url, info_hashes, timeout_duration, http).await
+        }
+        _ => scrape_counts_udp(tracker_url, info_hashes, timeout_duration, udp, dns).await,
     }
 }
 
@@ -127,11 +152,14 @@ async fn scrape_counts_udp(
     tracker_url: &str,
     info_hashes: &[InfoHash],
     timeout_duration: Duration,
+    udp: &UdpPool,
+    dns: &DnsCache,
 ) -> Result<Vec<(InfoHash, u32, u32)>> {
     let (host, port) = parse_tracker(tracker_url)?;
-    let addr = resolve_tracker_addr(&host, port)?;
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let connection_id = udp_connect(&socket, addr, timeout_duration).await?;
+    let addr = dns.resolve_tracker_v4(&host, port)?;
+    let lease = udp.acquire().await?;
+    let socket = &lease.socket;
+    let connection_id = udp_connection_id(socket, addr, timeout_duration).await?;
     let scrape_tx = random_transaction_id();
     let scrape = build_scrape(connection_id, info_hashes, scrape_tx);
     socket.send_to(&scrape, addr).await?;
@@ -150,6 +178,7 @@ async fn scrape_counts_http(
     url: &Url,
     info_hashes: &[InfoHash],
     timeout_duration: Duration,
+    http: &SharedHttp,
 ) -> Result<Vec<(InfoHash, u32, u32)>> {
     let mut scrape_url = format!(
         "{}://{}{}/scrape",
@@ -169,10 +198,9 @@ async fn scrape_counts_http(
         }
         scrape_url.push('&');
     }
-    let client = reqwest::Client::new();
     let response = timeout(
         timeout_duration,
-        client.get(scrape_url).send(),
+        http.client().get(scrape_url).send(),
     )
     .await??;
     let body = response.bytes().await?;
@@ -223,19 +251,23 @@ fn parse_tracker(url_str: &str) -> Result<(String, u16)> {
     Ok((host, port))
 }
 
-fn resolve_tracker_addr(host: &str, port: u16) -> Result<SocketAddr> {
-    let mut addrs: Vec<SocketAddr> = (host, port)
-        .to_socket_addrs()
-        .context("resolve tracker")?
-        .collect();
-    addrs.sort_by_key(|addr| match addr {
-        SocketAddr::V4(_) => 0,
-        SocketAddr::V6(_) => 1,
-    });
-    addrs
-        .into_iter()
-        .find(|addr| matches!(addr.ip(), IpAddr::V4(ip) if !ip.is_unspecified()))
-        .context("no ipv4 tracker address")
+async fn udp_connection_id(
+    socket: &UdpSocket,
+    addr: SocketAddr,
+    timeout_duration: Duration,
+) -> Result<u64> {
+    if let Ok(map) = udp_tracker_sessions().lock() {
+        if let Some((connection_id, until)) = map.get(&addr) {
+            if *until > Instant::now() {
+                return Ok(*connection_id);
+            }
+        }
+    }
+    let connection_id = udp_connect(socket, addr, timeout_duration).await?;
+    if let Ok(mut map) = udp_tracker_sessions().lock() {
+        map.insert(addr, (connection_id, Instant::now() + UDP_SESSION_TTL));
+    }
+    Ok(connection_id)
 }
 
 fn tracker_peer_id() -> [u8; 20] {

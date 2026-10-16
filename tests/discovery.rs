@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 #[tokio::test]
 async fn discovery_batcher_stores_bep51_without_enrich_queue() {
     let db = NamedTempFile::new().unwrap();
-    let store = Store::open(db.path(), 16, 10).unwrap();
+    let store = Store::open_for_tests(db.path()).unwrap();
     let (disc_tx, disc_rx) = mpsc::channel(64);
     let (enrich_tx, mut enrich_rx) = mpsc::channel(64);
 
@@ -58,7 +58,7 @@ async fn discovery_batcher_stores_bep51_without_enrich_queue() {
 #[tokio::test]
 async fn discovery_batcher_enqueues_announce_peer() {
     let db = NamedTempFile::new().unwrap();
-    let store = Store::open(db.path(), 16, 10).unwrap();
+    let store = Store::open_for_tests(db.path()).unwrap();
     let (disc_tx, disc_rx) = mpsc::channel(64);
     let (enrich_tx, mut enrich_rx) = mpsc::channel(64);
 

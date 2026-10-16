@@ -1,5 +1,6 @@
 mod discovery;
 mod enrichment;
+mod peer_collect;
 pub mod indexer;
 pub mod scrape;
 

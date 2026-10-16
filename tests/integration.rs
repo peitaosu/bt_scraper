@@ -11,6 +11,7 @@ use tempfile::{NamedTempFile, TempDir};
 fn pipeline_config_files_are_valid() {
     let _ = Config::load("config/default.toml").unwrap();
     let _ = Config::load("config/test.toml").unwrap();
+    let _ = Config::load("config/b550.toml").unwrap();
     let _ = ClassificationRules::load("config/classification.toml").unwrap();
 }
 
@@ -19,14 +20,14 @@ async fn store_survives_reopen() {
     let file = NamedTempFile::new().unwrap();
     let path = file.path().to_path_buf();
     {
-        let store = Store::open(&path, 32, 10).unwrap();
+        let store = Store::open_for_tests(&path).unwrap();
         store
             .process_discovery_batch(vec![(InfoHash([1u8; 20]), None)])
             .await
             .unwrap();
     }
     {
-        let store = Store::open(&path, 32, 10).unwrap();
+        let store = Store::open_for_tests(&path).unwrap();
         let (total, _, _) = store.count_by_status().await.unwrap();
         assert_eq!(total, 1);
     }
@@ -37,7 +38,6 @@ fn search_index_roundtrip() {
     let dir = TempDir::new().unwrap();
     let search = SearchIndex::open(dir.path()).unwrap();
     let rules = ClassificationRules::load("config/classification.toml").unwrap();
-    let mut writer = search.writer().unwrap();
     let hash = InfoHash([2u8; 20]);
     let metadata = TorrentMetadata {
         name: "Debian ISO".into(),
@@ -46,18 +46,21 @@ fn search_index_roundtrip() {
     };
     let classification = classify(&metadata, &rules);
     search
-        .upsert(
-            &mut writer,
-            &hash,
-            &metadata,
-            &classification,
-            1,
-            0,
-            1,
-            1,
-        )
+        .with_writer(|writer| {
+            search.upsert(
+                writer,
+                &hash,
+                &metadata,
+                &classification,
+                1,
+                0,
+                1,
+                1,
+            )?;
+            writer.commit()?;
+            Ok(())
+        })
         .unwrap();
-    writer.commit().unwrap();
     search.reload().unwrap();
 
     let result = search
@@ -72,6 +75,41 @@ fn search_index_roundtrip() {
         .unwrap();
     assert_eq!(result.hits.len(), 1);
     assert_eq!(result.hits[0].info_hash, hash.to_hex());
+}
+
+#[tokio::test]
+async fn store_mark_indexed_batch_and_snapshot() {
+    let file = NamedTempFile::new().unwrap();
+    let store = Store::open_for_tests(file.path()).unwrap();
+    let hash = InfoHash([12u8; 20]);
+    store
+        .process_discovery_batch(vec![(hash, None)])
+        .await
+        .unwrap();
+    store
+        .save_enriched(
+            &hash,
+            &TorrentMetadata {
+                name: "integration.mkv".into(),
+                files: vec![],
+                total_length: 42,
+            },
+            Some("video"),
+            Some(&["show".to_string()]),
+        )
+        .await
+        .unwrap();
+    store
+        .mark_indexed_batch(vec![bt_scraper::store::IndexMark {
+            info_hash: hash,
+            content_type: "video".into(),
+            tags: vec!["show".into()],
+        }])
+        .await
+        .unwrap();
+    let snapshot = store.pipeline_snapshot(bt_scraper::unix_now()).await.unwrap();
+    assert_eq!(snapshot.indexed, 1);
+    assert_eq!(snapshot.enriched, 1);
 }
 
 #[tokio::test]

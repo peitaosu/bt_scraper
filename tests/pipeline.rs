@@ -12,7 +12,7 @@ use tempfile::{NamedTempFile, TempDir};
 async fn index_batch_indexes_enriched_torrents() {
     let db = NamedTempFile::new().unwrap();
     let index_dir = TempDir::new().unwrap();
-    let store = Store::open(db.path(), 16, 10).unwrap();
+    let store = Store::open_for_tests(db.path()).unwrap();
     let search = Arc::new(SearchIndex::open(index_dir.path()).unwrap());
     let rules = ClassificationRules::load("config/classification.toml").unwrap();
     let backends = Arc::new(BackendContext {
@@ -33,6 +33,8 @@ async fn index_batch_indexes_enriched_torrents() {
                 files: vec![],
                 total_length: 5_000_000_000,
             },
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -42,6 +44,9 @@ async fn index_batch_indexes_enriched_torrents() {
         batch_size: 10,
         poll_interval_secs: 1,
         commit_batch: 5,
+        writer_heap_mb: 50,
+        reload_reader_on_commit: true,
+        patch_swarm_on_scrape: true,
     };
 
     let indexed = index_batch(&store, &search, &rules, &backends, &config, 10)
@@ -65,9 +70,9 @@ async fn index_batch_indexes_enriched_torrents() {
 }
 
 #[tokio::test]
-async fn tracker_scrape_update_triggers_reindex() {
+async fn tracker_scrape_update_keeps_index_queue_empty() {
     let db = NamedTempFile::new().unwrap();
-    let store = Store::open(db.path(), 16, 10).unwrap();
+    let store = Store::open_for_tests(db.path()).unwrap();
     let hash = InfoHash([21u8; 20]);
     store
         .process_discovery_batch(vec![(hash, None)])
@@ -81,6 +86,8 @@ async fn tracker_scrape_update_triggers_reindex() {
                 files: vec![],
                 total_length: 100,
             },
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -96,13 +103,15 @@ async fn tracker_scrape_update_triggers_reindex() {
         .unwrap();
 
     let candidates = store.get_index_candidates(10).await.unwrap();
-    assert_eq!(candidates.len(), 1);
+    assert!(candidates.is_empty());
+    let record = store.get_record(&hash).await.unwrap().unwrap();
+    assert_eq!(record.seeders, 99);
 }
 
 #[tokio::test]
 async fn blocked_torrents_never_reach_index() {
     let db = NamedTempFile::new().unwrap();
-    let store = Store::open(db.path(), 16, 10).unwrap();
+    let store = Store::open_for_tests(db.path()).unwrap();
     let hash = InfoHash([22u8; 20]);
     store
         .process_discovery_batch(vec![(hash, None)])
@@ -119,7 +128,7 @@ async fn blocked_torrents_never_reach_index() {
 #[tokio::test]
 async fn store_handles_concurrent_reads() {
     let db = NamedTempFile::new().unwrap();
-    let store = Store::open(db.path(), 16, 10).unwrap();
+    let store = Store::open_for_tests(db.path()).unwrap();
     for i in 0u8..20 {
         store
             .process_discovery_batch(vec![(InfoHash([i; 20]), None)])

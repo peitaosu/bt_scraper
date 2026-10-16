@@ -1,14 +1,17 @@
+mod read_pool;
 mod sql;
 mod writer;
 
 use crate::{InfoHash, Peer, TorrentMetadata, TorrentRecord};
 use anyhow::{Context, Result};
+use read_pool::ReadPool;
+use sql::schema::SqlitePragmas;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use writer::{StoreWriter, WriteOp, WriteReply};
 
 pub use sql::DiscoveryBatchResult;
-pub use sql::{PeerBreakdown, TorrentBreakdown};
+pub use sql::{IndexMark, PeerBreakdown, PipelineSnapshot, TorrentBreakdown};
 
 #[derive(Clone)]
 pub struct IndexCandidate {
@@ -18,22 +21,44 @@ pub struct IndexCandidate {
     pub leechers: u32,
     pub enriched_at: u64,
     pub discovered_at: u64,
+    pub content_type: Option<String>,
+    pub tags: Vec<String>,
 }
 
 pub struct Store {
     path: Arc<PathBuf>,
     writer: StoreWriter,
+    reads: Arc<ReadPool>,
+    peer_fail_threshold: u32,
 }
 
 impl Store {
-    pub fn open(path: impl AsRef<Path>, write_batch_size: usize, write_flush_ms: u64) -> Result<Arc<Self>> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        write_batch_size: usize,
+        write_flush_ms: u64,
+        read_pool_size: u32,
+        pragmas: SqlitePragmas,
+        peer_fail_threshold: u32,
+    ) -> Result<Arc<Self>> {
         let path = Arc::new(path.as_ref().to_path_buf());
         {
-            let conn = sql::open_write(&path)?;
+            let conn = sql::open_write_with_pragmas(&path, &pragmas)?;
             sql::initialize_store(&conn)?;
         }
-        let writer = StoreWriter::spawn(path.as_ref().clone(), write_batch_size, write_flush_ms)?;
-        Ok(Arc::new(Self { path, writer }))
+        let reads = ReadPool::open(&path, read_pool_size)?;
+        let writer = StoreWriter::spawn(
+            path.as_ref().clone(),
+            write_batch_size,
+            write_flush_ms,
+            pragmas,
+        )?;
+        Ok(Arc::new(Self {
+            path,
+            writer,
+            reads,
+            peer_fail_threshold,
+        }))
     }
 
     async fn read<T, F>(&self, f: F) -> Result<T>
@@ -41,13 +66,10 @@ impl Store {
         F: FnOnce(&rusqlite::Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = sql::open_read(&path)?;
-            f(&conn)
-        })
-        .await
-        .context("store read task panicked")?
+        let reads = self.reads.clone();
+        tokio::task::spawn_blocking(move || reads.with_conn(f))
+            .await
+            .context("store read task panicked")?
     }
 
     pub async fn process_discovery_batch(
@@ -68,13 +90,43 @@ impl Store {
         if peers.is_empty() {
             return Ok(());
         }
-        self.writer
+        let _ = self
+            .writer
             .write(WriteOp::UpsertPeers {
                 info_hash: *info_hash,
                 peers: peers.to_vec(),
             })
             .await?;
         Ok(())
+    }
+
+    pub async fn record_peer_failures(
+        &self,
+        info_hash: &InfoHash,
+        addrs: &[std::net::SocketAddr],
+    ) -> Result<()> {
+        if addrs.is_empty() {
+            return Ok(());
+        }
+        let _ = self.writer.write_fire_and_forget(WriteOp::RecordPeerFailures {
+            info_hash: *info_hash,
+            addrs: addrs.to_vec(),
+        })?;
+        Ok(())
+    }
+
+    pub fn open_from_config(
+        store: &crate::config::StoreConfig,
+        peer_fail_threshold: u32,
+    ) -> Result<Arc<Self>> {
+        Self::open(
+            &store.path,
+            store.write_batch_size,
+            store.write_flush_ms,
+            store.read_pool_size,
+            sqlite_pragmas_from_config(store),
+            peer_fail_threshold,
+        )
     }
 
     pub async fn is_enriched(&self, info_hash: &InfoHash) -> Result<bool> {
@@ -84,8 +136,14 @@ impl Store {
 
     pub async fn get_peers(&self, info_hash: &InfoHash, limit: usize) -> Result<Vec<Peer>> {
         let hash = *info_hash;
-        self.read(move |conn| sql::get_peers(conn, &hash, limit))
-            .await
+        let threshold = self.peer_fail_threshold;
+        self.read(move |conn| {
+            Ok(sql::get_peers(conn, &hash, limit, threshold)?
+                .into_iter()
+                .map(|stored| stored.peer)
+                .collect())
+        })
+        .await
     }
 
     pub async fn mark_enriching(&self, info_hash: &InfoHash) -> Result<()> {
@@ -97,11 +155,20 @@ impl Store {
         Ok(())
     }
 
-    pub async fn save_enriched(&self, info_hash: &InfoHash, metadata: &TorrentMetadata) -> Result<()> {
+    pub async fn save_enriched(
+        &self,
+        info_hash: &InfoHash,
+        metadata: &TorrentMetadata,
+        content_type: Option<&str>,
+        tags: Option<&[String]>,
+    ) -> Result<()> {
+        let tags_json = tags.map(serde_json::to_string).transpose()?;
         self.writer
             .write(WriteOp::SaveEnriched {
                 info_hash: *info_hash,
                 metadata: metadata.clone(),
+                content_type: content_type.map(str::to_string),
+                tags_json,
             })
             .await?;
         Ok(())
@@ -137,8 +204,10 @@ impl Store {
     }
 
     pub async fn has_quality_peer(&self, info_hash: &InfoHash) -> Result<bool> {
-        let peers = self.get_peers(info_hash, 64).await?;
-        Ok(peers.iter().any(|peer| crate::peer_policy::is_quality_peer(peer)))
+        let hash = *info_hash;
+        let threshold = self.peer_fail_threshold;
+        self.read(move |conn| sql::has_quality_peer(conn, &hash, threshold))
+            .await
     }
 
     pub async fn touch_peer_lookup(&self, info_hash: &InfoHash) -> Result<()> {
@@ -157,6 +226,10 @@ impl Store {
 
     pub async fn count_by_status(&self) -> Result<(u64, u64, u64)> {
         self.read(sql::count_by_status).await
+    }
+
+    pub async fn pipeline_snapshot(&self, now: u64) -> Result<PipelineSnapshot> {
+        self.read(move |conn| sql::pipeline_snapshot(conn, now)).await
     }
 
     pub async fn peer_breakdown(&self) -> Result<PeerBreakdown> {
@@ -182,12 +255,23 @@ impl Store {
         content_type: &str,
         tags: &[String],
     ) -> Result<()> {
-        self.writer
+        let _ = self
+            .writer
             .write(WriteOp::MarkIndexed {
                 info_hash: *info_hash,
                 content_type: content_type.to_string(),
                 tags: tags.to_vec(),
             })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_indexed_batch(&self, marks: Vec<IndexMark>) -> Result<()> {
+        if marks.is_empty() {
+            return Ok(());
+        }
+        self.writer
+            .write(WriteOp::MarkIndexedBatch { marks })
             .await?;
         Ok(())
     }
@@ -258,14 +342,35 @@ impl Store {
     }
 
     pub async fn export_enriched(&self) -> Result<Vec<TorrentRecord>> {
-        let hashes = self.read(sql::export_enriched_hashes).await?;
-        let mut records = Vec::new();
-        for hash in hashes {
-            if let Some(record) = self.get_record(&hash).await? {
-                records.push(record);
+        self.read(|conn| {
+            let hashes = sql::export_enriched_hashes(conn)?;
+            let mut records = Vec::with_capacity(hashes.len());
+            for hash in hashes {
+                if let Some(record) = sql::get_record(conn, &hash)? {
+                    records.push(record);
+                }
             }
-        }
-        Ok(records)
+            Ok(records)
+        })
+        .await
+    }
+
+    pub fn open_for_tests(path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        Self::open(
+            path,
+            16,
+            10,
+            2,
+            SqlitePragmas::default(),
+            3,
+        )
+    }
+}
+
+pub fn sqlite_pragmas_from_config(config: &crate::config::StoreConfig) -> SqlitePragmas {
+    SqlitePragmas {
+        cache_size_kb: config.sqlite_cache_size_kb,
+        mmap_size_bytes: config.sqlite_mmap_size_mb * 1024 * 1024,
     }
 }
 
@@ -277,7 +382,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     async fn test_store(path: &Path) -> Arc<Store> {
-        Store::open(path, 32, 10).unwrap()
+        Store::open(path, 32, 10, 2, SqlitePragmas::default(), 3).unwrap()
     }
 
     #[tokio::test]
@@ -301,6 +406,8 @@ mod tests {
                     files: vec![],
                     total_length: 1024,
                 },
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -337,6 +444,8 @@ mod tests {
                     files: vec![],
                     total_length: 100,
                 },
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -362,7 +471,7 @@ mod tests {
         assert!(scrape_candidates.is_empty());
 
         let reindex = store.get_index_candidates(10).await.unwrap();
-        assert_eq!(reindex.len(), 1);
+        assert_eq!(reindex.len(), 0);
     }
 
     #[tokio::test]
@@ -382,5 +491,98 @@ mod tests {
             let record = store.get_record(&InfoHash([4u8; 20])).await.unwrap().unwrap();
             assert_eq!(record.status, crate::EnrichmentStatus::Discovered);
         }
+    }
+
+    #[tokio::test]
+    async fn record_peer_failures_updates_quality_gate() {
+        let file = NamedTempFile::new().unwrap();
+        let store = test_store(file.path()).await;
+        let hash = InfoHash([8u8; 20]);
+        store
+            .process_discovery_batch(vec![(hash, None)])
+            .await
+            .unwrap();
+        let addr = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 8), 6888));
+        let peer = Peer::new(addr, PeerSource::Dht);
+        store.upsert_peers(&hash, &[peer]).await.unwrap();
+        assert!(store.has_quality_peer(&hash).await.unwrap());
+        for _ in 0..3 {
+            store.record_peer_failures(&hash, &[addr]).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!store.has_quality_peer(&hash).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mark_indexed_batch_via_writer() {
+        let file = NamedTempFile::new().unwrap();
+        let store = test_store(file.path()).await;
+        let first = InfoHash([9u8; 20]);
+        let second = InfoHash([10u8; 20]);
+        for hash in [first, second] {
+            store
+                .process_discovery_batch(vec![(hash, None)])
+                .await
+                .unwrap();
+            store
+                .save_enriched(
+                    &hash,
+                    &TorrentMetadata {
+                        name: "batch".into(),
+                        files: vec![],
+                        total_length: 1,
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .mark_indexed_batch(vec![
+                IndexMark {
+                    info_hash: first,
+                    content_type: "video".into(),
+                    tags: vec!["tag".into()],
+                },
+                IndexMark {
+                    info_hash: second,
+                    content_type: "audio".into(),
+                    tags: vec![],
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(store.count_indexed().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn pipeline_snapshot_via_read_pool() {
+        let file = NamedTempFile::new().unwrap();
+        let store = test_store(file.path()).await;
+        let hash = InfoHash([11u8; 20]);
+        store
+            .process_discovery_batch(vec![(hash, None)])
+            .await
+            .unwrap();
+        let now = unix_now();
+        store.mark_failed(&hash, now + 7200).await.unwrap();
+        let snapshot = store.pipeline_snapshot(now).await.unwrap();
+        assert_eq!(snapshot.total, 1);
+        assert_eq!(snapshot.retry_queue, 0);
+        assert_eq!(snapshot.torrents.failed, 1);
+    }
+
+    #[test]
+    fn sqlite_pragmas_from_config_scales_mmap() {
+        let store = crate::config::Config::load("config/default.toml")
+            .unwrap()
+            .store;
+        let pragmas = sqlite_pragmas_from_config(&store);
+        assert_eq!(pragmas.cache_size_kb, store.sqlite_cache_size_kb);
+        assert_eq!(
+            pragmas.mmap_size_bytes,
+            store.sqlite_mmap_size_mb * 1024 * 1024
+        );
     }
 }

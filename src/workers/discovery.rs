@@ -37,17 +37,18 @@ pub async fn run_discovery_batcher(
                             DiscoverySource::AnnouncePeer
                         ) && item.peer.is_some();
                         if immediate_announce {
-                            flush_discovery_batch(&store, &enrich_tx, &mut vec![item]).await;
+                            flush_discovery_batch(&store, &enrich_tx, std::slice::from_ref(&item)).await;
                         } else {
                             buffer.push(item);
                             if buffer.len() >= settings.batch_size {
-                                flush_discovery_batch(&store, &enrich_tx, &mut buffer).await;
+                                flush_discovery_batch(&store, &enrich_tx, &buffer).await;
+                                buffer.clear();
                             }
                         }
                     }
                     None => {
                         if !buffer.is_empty() {
-                            flush_discovery_batch(&store, &enrich_tx, &mut buffer).await;
+                            flush_discovery_batch(&store, &enrich_tx, &buffer).await;
                         }
                         break;
                     }
@@ -55,7 +56,8 @@ pub async fn run_discovery_batcher(
             }
             _ = interval.tick() => {
                 if !buffer.is_empty() {
-                    flush_discovery_batch(&store, &enrich_tx, &mut buffer).await;
+                    flush_discovery_batch(&store, &enrich_tx, &buffer).await;
+                    buffer.clear();
                 }
             }
         }
@@ -65,7 +67,7 @@ pub async fn run_discovery_batcher(
 async fn flush_discovery_batch(
     store: &Store,
     enrich_tx: &mpsc::Sender<InfoHash>,
-    buffer: &mut Vec<DiscoveredHash>,
+    buffer: &[DiscoveredHash],
 ) {
     if buffer.is_empty() {
         return;
@@ -74,7 +76,7 @@ async fn flush_discovery_batch(
     let mut get_peers = 0usize;
     let mut announce = 0usize;
     let items: Vec<(InfoHash, Option<Peer>)> = buffer
-        .drain(..)
+        .iter()
         .map(|item| {
             match item.source {
                 DiscoverySource::Bep51 => bep51 += 1,
@@ -101,7 +103,8 @@ async fn flush_discovery_batch(
             );
             for hash in result.to_enrich {
                 debug!(hash = %hash, "discovery enqueued for enrichment");
-                if enrich_tx.send(hash).await.is_err() {
+                if enrich_tx.try_send(hash).is_err() {
+                    metrics::counter!("enrich_queue_dropped_total").increment(1);
                     return;
                 }
             }

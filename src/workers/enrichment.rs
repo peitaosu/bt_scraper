@@ -2,54 +2,44 @@ use anyhow::Result;
 use crate::classify::classify;
 use crate::domain::pipeline::may_schedule_enrichment;
 use crate::classification_config::ClassificationRules;
+use crate::infra::TrackerGateway;
+use crate::peer_policy::is_storable_peer;
 use crate::ports::DhtPeerLookup;
-use crate::peer_policy::{is_quality_peer, peer_source_rank};
 use crate::store::Store;
-use crate::tracker::fetch_peers;
-use crate::wire::fetch_metadata;
-use crate::{InfoHash, Peer, PeerSource, TorrentMetadata, unix_now};
-use std::collections::HashSet;
+use crate::wire::fetch_metadata_with_connect_timeout;
+use crate::{InfoHash, Peer, TorrentMetadata, unix_now};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use super::peer_collect::{collect_peers, PeerCollectConfig};
+
 #[derive(Clone)]
 pub struct EnrichSettings {
     pub concurrency: usize,
     pub peers_per_hash: usize,
     pub peer_timeout_secs: u64,
+    pub connect_timeout_secs: u64,
     pub retry_base_secs: u64,
     pub retry_max_secs: u64,
     pub retry_max_attempts: u32,
     pub tracker_peer_urls: Vec<String>,
     pub rules: Arc<ClassificationRules>,
-}
-
-fn quality_peers(peers: &[Peer]) -> Vec<Peer> {
-    peers.iter().copied().filter(|p| is_quality_peer(p)).collect()
-}
-
-fn peer_counts(peers: &[Peer]) -> (usize, usize, usize) {
-    let mut announce = 0usize;
-    let mut dht = 0usize;
-    let mut tracker = 0usize;
-    for peer in peers {
-        match peer.source {
-            PeerSource::Announce => announce += 1,
-            PeerSource::Dht => dht += 1,
-            PeerSource::Tracker => tracker += 1,
-        }
-    }
-    (announce, dht, tracker)
+    pub skip_dht_if_cached_peers: bool,
+    pub tracker_urls_per_lookup: usize,
+    pub peer_fail_threshold: u32,
 }
 
 pub async fn run_enrichment_pool(
     rx: mpsc::Receiver<InfoHash>,
     store: Arc<Store>,
     dht: Arc<dyn DhtPeerLookup>,
+    trackers: Arc<TrackerGateway>,
     config: EnrichSettings,
+    tcp_limit: Arc<Semaphore>,
 ) {
     let semaphore = Arc::new(Semaphore::new(config.concurrency));
     let mut rx = rx;
@@ -62,12 +52,19 @@ pub async fn run_enrichment_pool(
             Ok(permit) => permit,
             Err(_) => break,
         };
+        let tcp_permit = match tcp_limit.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
         let store = store.clone();
         let dht = dht.clone();
+        let trackers = trackers.clone();
         let config = config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = enrich_one(&store, dht.as_ref(), &info_hash, &config).await {
+            let _tcp = tcp_permit;
+            if let Err(error) = enrich_one(&store, dht.as_ref(), &trackers, &info_hash, &config).await
+            {
                 debug!(hash = %info_hash, error = %error, "enrichment failed");
             }
         });
@@ -77,15 +74,17 @@ pub async fn run_enrichment_pool(
 pub async fn run_enrichment_scheduler(
     store: Arc<Store>,
     dht: Arc<dyn DhtPeerLookup>,
+    trackers: Arc<TrackerGateway>,
     enrich_tx: mpsc::Sender<InfoHash>,
     config: EnrichSettings,
     interval_secs: u64,
     batch: usize,
+    lookup_concurrency: usize,
+    batch_max: usize,
     cancel: CancellationToken,
 ) {
-    let batch = batch.clamp(1, 64);
-    let lookup_concurrency = 8;
-    let semaphore = Arc::new(Semaphore::new(lookup_concurrency));
+    let batch = batch.clamp(1, batch_max);
+    let semaphore = Arc::new(Semaphore::new(lookup_concurrency.max(1)));
     loop {
         if cancel.is_cancelled() {
             return;
@@ -120,11 +119,12 @@ pub async fn run_enrichment_scheduler(
         for hash in candidates {
             let store = store.clone();
             let dht = dht.clone();
+            let trackers = trackers.clone();
             let config = config.clone();
             let semaphore = semaphore.clone();
             set.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.ok()?;
-                let decision = should_enqueue(&store, dht.as_ref(), &hash, &config).await;
+                let decision = should_enqueue(&store, dht.as_ref(), &trackers, &hash, &config).await;
                 Some((hash, decision))
             });
         }
@@ -142,7 +142,8 @@ pub async fn run_enrichment_scheduler(
                 EnqueueDecision::Skip => {}
             }
             if enqueue {
-                if enrich_tx.send(hash).await.is_err() {
+                if enrich_tx.try_send(hash).is_err() {
+                    metrics::counter!("enrich_queue_dropped_total").increment(1);
                     return;
                 }
                 enqueued += 1;
@@ -172,6 +173,7 @@ enum EnqueueDecision {
 async fn should_enqueue(
     store: &Store,
     dht: &dyn DhtPeerLookup,
+    trackers: &TrackerGateway,
     info_hash: &InfoHash,
     config: &EnrichSettings,
 ) -> EnqueueDecision {
@@ -186,27 +188,14 @@ async fn should_enqueue(
         debug!(hash = %info_hash, "scheduler enqueued: cached quality peer");
         return EnqueueDecision::CachedQuality;
     }
-    let peers = collect_peers(store, dht, info_hash, config).await;
+    let peers = collect_peers_for_config(store, dht, trackers, info_hash, config).await;
     let _ = store.touch_peer_lookup(info_hash).await;
-    let (announce, dht_count, tracker) = peer_counts(&peers);
-    if quality_peers(&peers).is_empty() {
-        debug!(
-            hash = %info_hash,
-            announce,
-            dht = dht_count,
-            tracker,
-            "scheduler skipped: no quality peers"
-        );
-        return EnqueueDecision::Skip;
+    if peers.iter().any(|p| is_storable_peer(p)) {
+        debug!(hash = %info_hash, "scheduler enqueued: found quality peers");
+        return EnqueueDecision::FoundQuality;
     }
-    debug!(
-        hash = %info_hash,
-        announce,
-        dht = dht_count,
-        tracker,
-        "scheduler enqueued: found quality peers"
-    );
-    EnqueueDecision::FoundQuality
+    debug!(hash = %info_hash, "scheduler skipped: no quality peers");
+    EnqueueDecision::Skip
 }
 
 pub async fn run_failed_requeue_loop(
@@ -262,6 +251,7 @@ pub async fn run_peer_prune_loop(
 async fn enrich_one(
     store: &Store,
     dht: &dyn DhtPeerLookup,
+    trackers: &TrackerGateway,
     info_hash: &InfoHash,
     config: &EnrichSettings,
 ) -> Result<()> {
@@ -286,70 +276,92 @@ async fn enrich_one(
         .unwrap_or(1);
 
     let started = Instant::now();
-    let peers = collect_peers(store, dht, info_hash, config).await;
-    let (announce, dht_count, tracker) = peer_counts(&peers);
-    let mut peers = quality_peers(&peers);
-    peers.sort_by_key(|peer| peer_source_rank(peer.source));
-    peers.truncate(config.peers_per_hash);
+    let peers = collect_peers_for_config(store, dht, trackers, info_hash, config).await;
+    let peers: Vec<Peer> = peers
+        .into_iter()
+        .filter(|peer| is_storable_peer(peer))
+        .take(config.peers_per_hash)
+        .collect();
     if peers.is_empty() {
         schedule_retry(store, info_hash, config, attempt).await?;
         metrics::counter!("enrichment_no_peers_total").increment(1);
-        debug!(
-            hash = %info_hash,
-            attempt,
-            announce,
-            dht = dht_count,
-            tracker,
-            "enrichment deferred: no quality peers"
-        );
         return Ok(());
     }
 
-    let peer_addrs: Vec<_> = peers.iter().map(|p| format!("{} ({:?})", p.addr, p.source)).collect();
-    debug!(
-        hash = %info_hash,
-        attempt,
-        peers = %peer_addrs.join(", "),
-        "enrichment trying metadata fetch"
-    );
-
     let timeout = Duration::from_secs(config.peer_timeout_secs);
+    let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
     let peer_count = peers.len();
-    let (metadata, last_error) = race_metadata(info_hash, peers, timeout).await;
+    let tried_addrs: Vec<SocketAddr> = peers.iter().map(|p| p.addr).collect();
+    let (metadata, last_error) =
+        race_metadata(info_hash, peers, timeout, connect_timeout).await;
     metrics::histogram!("metadata_latency_seconds").record(started.elapsed().as_secs_f64());
 
     if let Some(metadata) = metadata {
-        if classify(&metadata, &config.rules).blocked {
+        let classification = classify(&metadata, &config.rules);
+        if classification.blocked {
             store.mark_blocked(info_hash).await?;
             metrics::counter!("metadata_blocked_total").increment(1);
             info!(hash = %info_hash, "blocked at ingest");
             return Ok(());
         }
-        store.save_enriched(info_hash, &metadata).await?;
+        store
+            .save_enriched(
+                info_hash,
+                &metadata,
+                Some(&classification.content_type),
+                Some(&classification.tags),
+            )
+            .await?;
         metrics::counter!("metadata_success_total").increment(1);
         info!(hash = %info_hash, name = %metadata.name, "enriched");
         return Ok(());
     }
 
+    let _ = store.record_peer_failures(info_hash, &tried_addrs).await;
     metrics::counter!("metadata_failure_total").increment(1);
     schedule_retry(store, info_hash, config, attempt).await?;
     warn!(
         hash = %info_hash,
         attempt,
         peers = peer_count,
-        announce,
-        dht = dht_count,
-        tracker,
         last_error = last_error.as_deref().unwrap_or("unknown"),
         "enrichment failed: metadata fetch"
     );
     Ok(())
 }
 
+fn collect_config(config: &EnrichSettings) -> PeerCollectConfig {
+    PeerCollectConfig {
+        skip_dht_if_cached: config.skip_dht_if_cached_peers,
+        tracker_urls: config.tracker_peer_urls.clone(),
+        tracker_urls_per_lookup: config.tracker_urls_per_lookup,
+        peer_timeout: Duration::from_secs(config.peer_timeout_secs),
+        cached_peer_limit: 64,
+    }
+}
+
+async fn collect_peers_for_config(
+    store: &Store,
+    dht: &dyn DhtPeerLookup,
+    trackers: &TrackerGateway,
+    info_hash: &InfoHash,
+    config: &EnrichSettings,
+) -> Vec<Peer> {
+    collect_peers(
+        store,
+        dht,
+        trackers,
+        info_hash,
+        &collect_config(config),
+    )
+    .await
+}
+
 async fn race_metadata(
     info_hash: &InfoHash,
     peers: Vec<Peer>,
     timeout: Duration,
+    connect_timeout: Duration,
 ) -> (Option<TorrentMetadata>, Option<String>) {
     let mut set = tokio::task::JoinSet::new();
     for peer in peers {
@@ -357,7 +369,7 @@ async fn race_metadata(
         let addr = peer.addr;
         let source = peer.source;
         set.spawn(async move {
-            fetch_metadata(&hash, addr, timeout)
+            fetch_metadata_with_connect_timeout(&hash, addr, timeout, connect_timeout)
                 .await
                 .map_err(|error| (addr, source, error))
         });
@@ -371,90 +383,13 @@ async fn race_metadata(
             }
             Ok(Err((addr, source, error))) => {
                 last_error = Some(format!("{addr} ({source:?}): {error:#}"));
-                debug!(
-                    hash = %info_hash,
-                    %addr,
-                    ?source,
-                    error = %error,
-                    "metadata peer failed"
-                );
             }
             Err(error) => {
                 last_error = Some(format!("task: {error:#}"));
-                debug!(hash = %info_hash, %error, "metadata task failed");
             }
         }
     }
     (None, last_error)
-}
-
-async fn collect_peers(
-    store: &Store,
-    dht: &dyn DhtPeerLookup,
-    info_hash: &InfoHash,
-    config: &EnrichSettings,
-) -> Vec<Peer> {
-    let hash = *info_hash;
-    let store_cached = store;
-    let dht_lookup = dht.lookup_peers(info_hash);
-    let tracker_urls = config.tracker_peer_urls.clone();
-    let tracker_timeout = Duration::from_secs(config.peer_timeout_secs);
-
-    let (cached, dht_peers, tracker_peers) = tokio::join!(
-        async move { store_cached.get_peers(&hash, 64).await.unwrap_or_default() },
-        dht_lookup,
-        fetch_tracker_peers(&hash, &tracker_urls, tracker_timeout),
-    );
-
-    let mut set = HashSet::new();
-    let mut peers = Vec::new();
-    let mut pending_upsert = Vec::new();
-
-    for peer in cached {
-        if set.insert(peer.addr) {
-            peers.push(peer);
-        }
-    }
-    for peer in dht_peers {
-        pending_upsert.push(peer.clone());
-        if set.insert(peer.addr) {
-            peers.push(peer);
-        }
-    }
-    for peer in tracker_peers {
-        pending_upsert.push(peer.clone());
-        if set.insert(peer.addr) {
-            peers.push(peer);
-        }
-    }
-
-    if !pending_upsert.is_empty() {
-        let _ = store.upsert_peers(info_hash, &pending_upsert).await;
-    }
-
-    peers.sort_by_key(|peer| peer_source_rank(peer.source));
-
-    peers
-}
-
-async fn fetch_tracker_peers(
-    info_hash: &InfoHash,
-    tracker_urls: &[String],
-    timeout: Duration,
-) -> Vec<Peer> {
-    let mut set = tokio::task::JoinSet::new();
-    for url in tracker_urls {
-        let url = url.clone();
-        let hash = *info_hash;
-        set.spawn(async move { fetch_peers(&url, &hash, timeout).await });
-    }
-    let mut peers = Vec::new();
-    while let Some(result) = set.join_next().await {
-        if let Ok(Ok(mut tracker_peers)) = result {
-            peers.append(&mut tracker_peers);
-        }
-    }
-    peers
 }
 
 async fn schedule_retry(

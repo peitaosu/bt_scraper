@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 #[tokio::test]
 async fn private_announce_peer_is_not_stored_as_quality() {
     let db = NamedTempFile::new().unwrap();
-    let store = Store::open(db.path(), 16, 10).unwrap();
+    let store = Store::open_for_tests(db.path()).unwrap();
     let (disc_tx, disc_rx) = mpsc::channel(8);
     let (enrich_tx, _enrich_rx) = mpsc::channel(8);
 

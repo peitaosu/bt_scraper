@@ -3,19 +3,41 @@ use super::row::parse_status;
 use crate::{InfoHash, TorrentMetadata, TorrentRecord, unix_now};
 use anyhow::Result;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 
 pub fn reset_failed_without_quality_peers(conn: &Connection) -> Result<u64> {
     let changed = conn.execute(
         "UPDATE torrents SET status = 'discovered', next_retry_at = NULL
          WHERE status = 'failed'
-           AND NOT EXISTS (
-             SELECT 1 FROM peers p
-             WHERE p.info_hash = torrents.info_hash
-               AND p.source IN ('announce', 'tracker', 'dht')
-           )",
+           AND quality_peer_count = 0",
         [],
     )?;
     Ok(changed as u64)
+}
+
+pub fn load_status_map(conn: &Connection, hashes: &[InfoHash]) -> Result<HashMap<InfoHash, String>> {
+    let mut map = HashMap::new();
+    if hashes.is_empty() {
+        return Ok(map);
+    }
+    let placeholders: String = hashes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT info_hash, status FROM torrents WHERE info_hash IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<_> = hashes
+        .iter()
+        .map(|hash| rusqlite::types::Value::Blob(hash.0.to_vec()))
+        .collect();
+    let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        let bytes: Vec<u8> = row.get(0)?;
+        let status: String = row.get(1)?;
+        if bytes.len() == 20 {
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            map.insert(InfoHash(arr), status);
+        }
+    }
+    Ok(map)
 }
 
 pub fn is_enriched(conn: &Connection, info_hash: &InfoHash) -> Result<bool> {
@@ -60,7 +82,13 @@ pub fn mark_enriching(conn: &Connection, info_hash: &InfoHash) -> Result<()> {
     Ok(())
 }
 
-pub fn save_enriched(conn: &Connection, info_hash: &InfoHash, metadata: &TorrentMetadata) -> Result<()> {
+pub fn save_enriched(
+    conn: &Connection,
+    info_hash: &InfoHash,
+    metadata: &TorrentMetadata,
+    content_type: Option<&str>,
+    tags_json: Option<&str>,
+) -> Result<()> {
     let now = unix_now() as i64;
     let files_json = serde_json::to_string(&metadata.files)?;
     conn.execute(
@@ -70,14 +98,18 @@ pub fn save_enriched(conn: &Connection, info_hash: &InfoHash, metadata: &Torrent
             files_json = ?3,
             total_length = ?4,
             enriched_at = ?5,
-            next_retry_at = NULL
+            next_retry_at = NULL,
+            content_type = COALESCE(?6, content_type),
+            tags_json = COALESCE(?7, tags_json)
          WHERE info_hash = ?1",
         params![
             info_hash.0.as_slice(),
             metadata.name,
             files_json,
             metadata.total_length as i64,
-            now
+            now,
+            content_type,
+            tags_json
         ],
     )?;
     Ok(())
@@ -106,12 +138,9 @@ pub fn get_retry_candidates(conn: &Connection, limit: usize, now: u64) -> Result
         "SELECT info_hash FROM torrents
          WHERE status IN ('discovered', 'failed')
            AND (next_retry_at IS NULL OR next_retry_at <= ?1)
-         ORDER BY
-           (SELECT COUNT(*) FROM peers p
-            WHERE p.info_hash = torrents.info_hash
-              AND p.source IN ('announce', 'tracker', 'dht')) DESC,
-           COALESCE(peer_lookup_at, 0) ASC,
-           discovered_at ASC
+         ORDER BY quality_peer_count DESC,
+                  COALESCE(peer_lookup_at, 0) ASC,
+                  discovered_at ASC
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![now as i64, limit as i64], |row| {
@@ -252,6 +281,44 @@ mod tests {
         let (_, enriched, pending) = super::super::stats::count_by_status(&conn).unwrap();
         assert_eq!(enriched, 0);
         assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn load_status_map_returns_only_existing_hashes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = super::super::schema::open_write(file.path()).unwrap();
+        let present = InfoHash([20u8; 20]);
+        let missing = InfoHash([21u8; 20]);
+        insert_discovered(&conn, &present).unwrap();
+        mark_failed(&conn, &present, unix_now() + 60).unwrap();
+        let map = load_status_map(&conn, &[present, missing]).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&present).map(String::as_str), Some("failed"));
+        assert!(map.get(&missing).is_none());
+    }
+
+    #[test]
+    fn retry_candidates_prefer_more_quality_peers() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = super::super::schema::open_write(file.path()).unwrap();
+        let strong = InfoHash([22u8; 20]);
+        let weak = InfoHash([23u8; 20]);
+        insert_discovered(&conn, &strong).unwrap();
+        insert_discovered(&conn, &weak).unwrap();
+        let peers = vec![
+            Peer::new(
+                SocketAddr::from((Ipv4Addr::new(1, 2, 3, 1), 6881)),
+                PeerSource::Dht,
+            ),
+            Peer::new(
+                SocketAddr::from((Ipv4Addr::new(1, 2, 3, 2), 6882)),
+                PeerSource::Dht,
+            ),
+        ];
+        super::super::peers::upsert_peers(&conn, &strong, &peers).unwrap();
+        let ordered = get_retry_candidates(&conn, 2, unix_now()).unwrap();
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0], strong);
     }
 
     #[test]

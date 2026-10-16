@@ -23,9 +23,21 @@ pub async fn fetch_metadata(
     peer: SocketAddr,
     peer_timeout: Duration,
 ) -> Result<TorrentMetadata> {
-    timeout(peer_timeout, fetch_metadata_inner(info_hash, peer))
-        .await
-        .context("metadata timeout")?
+    fetch_metadata_with_connect_timeout(info_hash, peer, peer_timeout, Duration::from_secs(8)).await
+}
+
+pub async fn fetch_metadata_with_connect_timeout(
+    info_hash: &InfoHash,
+    peer: SocketAddr,
+    peer_timeout: Duration,
+    connect_timeout: Duration,
+) -> Result<TorrentMetadata> {
+    timeout(
+        peer_timeout,
+        fetch_metadata_inner(info_hash, peer, connect_timeout),
+    )
+    .await
+    .context("metadata timeout")?
 }
 
 struct PeerConn {
@@ -74,7 +86,8 @@ impl PeerConn {
     }
 
     fn drain(&mut self, count: usize) -> Vec<u8> {
-        self.read_buf.drain(..count).collect()
+        let end = count.min(self.read_buf.len());
+        self.read_buf.drain(..end).collect()
     }
 
     async fn read_length_message(&mut self) -> Result<Vec<u8>> {
@@ -176,8 +189,11 @@ impl PeerConn {
     }
 }
 
-async fn fetch_metadata_inner(info_hash: &InfoHash, peer: SocketAddr) -> Result<TorrentMetadata> {
-    let connect_timeout = Duration::from_secs(8);
+async fn fetch_metadata_inner(
+    info_hash: &InfoHash,
+    peer: SocketAddr,
+    connect_timeout: Duration,
+) -> Result<TorrentMetadata> {
     let mut conn = PeerConn::connect(peer, connect_timeout).await?;
 
     conn.send_handshake(info_hash).await.context("send handshake")?;

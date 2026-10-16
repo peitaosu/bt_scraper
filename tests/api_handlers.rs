@@ -38,7 +38,7 @@ async fn health_returns_ok() {
 #[tokio::test]
 async fn stats_reflects_store_counts() {
     let file = NamedTempFile::new().unwrap();
-    let store = Store::open(file.path(), 16, 10).unwrap();
+    let store = Store::open_for_tests(file.path()).unwrap();
     store
         .process_discovery_batch(vec![
             (InfoHash([1u8; 20]), None),
@@ -57,7 +57,7 @@ async fn stats_reflects_store_counts() {
 #[tokio::test]
 async fn search_empty_index_returns_zero_total() {
     let file = NamedTempFile::new().unwrap();
-    let store = Store::open(file.path(), 16, 10).unwrap();
+    let store = Store::open_for_tests(file.path()).unwrap();
     let state = app_state(store).await;
     let response = api::search(
         axum::extract::State(state),

@@ -16,6 +16,10 @@ pub fn register_metrics() {
         "Inbound discovery events dropped when the channel is full"
     );
     metrics::describe_counter!(
+        "enrich_queue_dropped_total",
+        "Enrichment queue drops when the channel is full"
+    );
+    metrics::describe_counter!(
         "metadata_success_total",
         "Torrent metadata fetches that succeeded"
     );

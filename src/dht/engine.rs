@@ -14,6 +14,7 @@ use super::sample_store::SampleStore;
 pub struct DhtEngine {
     dht: Arc<AsyncDht>,
     sample_store: Arc<Mutex<SampleStore>>,
+    lookup_timeout: Duration,
 }
 
 fn parse_bind_v4(bind: &str) -> Result<(Ipv4Addr, u16)> {
@@ -73,6 +74,7 @@ impl DhtEngine {
         bootstrap: &[String],
         persisted_bootstrap: &[String],
         discovery_tx: mpsc::Sender<DiscoveredHash>,
+        lookup_timeout_secs: u64,
     ) -> Result<Arc<Self>> {
         let sample_store = Arc::new(Mutex::new(SampleStore::default_cap()));
         let dht = build_dht_node(
@@ -83,7 +85,11 @@ impl DhtEngine {
             sample_store.clone(),
         )?;
         info!(bind = %bind, "dht node listening");
-        Ok(Arc::new(Self { dht, sample_store }))
+        Ok(Arc::new(Self {
+            dht,
+            sample_store,
+            lookup_timeout: Duration::from_secs(lookup_timeout_secs.max(1)),
+        }))
     }
 
     pub fn async_dht(&self) -> Arc<AsyncDht> {
@@ -92,6 +98,10 @@ impl DhtEngine {
 
     pub fn sample_store(&self) -> Arc<Mutex<SampleStore>> {
         self.sample_store.clone()
+    }
+
+    pub fn lookup_timeout(&self) -> Duration {
+        self.lookup_timeout
     }
 
     pub async fn wait_bootstrapped(&self) {
@@ -128,7 +138,7 @@ impl DhtEngine {
                 }
             }
         };
-        let _ = tokio::time::timeout(Duration::from_secs(5), lookup).await;
+        let _ = tokio::time::timeout(self.lookup_timeout, lookup).await;
         peers
     }
 

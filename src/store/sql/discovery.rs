@@ -1,5 +1,5 @@
 use super::peers::upsert_peer;
-use super::torrent::{insert_discovered, is_blocked, is_enriched};
+use super::torrent::{insert_discovered, load_status_map};
 use crate::{InfoHash, Peer, PeerSource};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -14,12 +14,21 @@ pub fn process_discovery_batch(
     conn: &Connection,
     items: &[(InfoHash, Option<Peer>)],
 ) -> Result<DiscoveryBatchResult> {
+    if items.is_empty() {
+        return Ok(DiscoveryBatchResult {
+            to_enrich: Vec::new(),
+            newly_discovered: 0,
+        });
+    }
+    let hashes: Vec<InfoHash> = items.iter().map(|(hash, _)| *hash).collect();
+    let status_map = load_status_map(conn, &hashes)?;
+
     let tx = conn.unchecked_transaction()?;
     let mut to_enrich = Vec::new();
     let mut enrich_set = HashSet::new();
     let mut newly_discovered = 0usize;
     for (info_hash, peer) in items {
-        if is_enriched(&tx, info_hash)? || is_blocked(&tx, info_hash)? {
+        if skip_hash(status_map.get(info_hash)) {
             continue;
         }
         if insert_discovered(&tx, info_hash)? {
@@ -38,6 +47,13 @@ pub fn process_discovery_batch(
         to_enrich,
         newly_discovered,
     })
+}
+
+fn skip_hash(status: Option<&String>) -> bool {
+    matches!(
+        status.map(String::as_str),
+        Some("enriched") | Some("blocked")
+    )
 }
 
 #[cfg(test)]
@@ -99,7 +115,7 @@ mod tests {
     fn discovery_batch_skips_enriched() {
         let (_file, conn) = temp_conn();
         let hash = InfoHash([5u8; 20]);
-        insert_discovered(&conn, &hash).unwrap();
+        super::super::torrent::insert_discovered(&conn, &hash).unwrap();
         super::super::torrent::save_enriched(
             &conn,
             &hash,
@@ -108,6 +124,8 @@ mod tests {
                 files: vec![],
                 total_length: 1,
             },
+            None,
+            None,
         )
         .unwrap();
 
@@ -125,16 +143,16 @@ mod tests {
             PeerSource::Announce,
         );
         process_discovery_batch(&conn, &[(hash, Some(peer))]).unwrap();
-        let peers = super::super::peers::get_peers(&conn, &hash, 10).unwrap();
+        let peers = super::super::peers::get_peers(&conn, &hash, 10, 3).unwrap();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].source, PeerSource::Announce);
+        assert_eq!(peers[0].peer.source, PeerSource::Announce);
     }
 
     #[test]
     fn discovery_batch_skips_blocked() {
         let (_file, conn) = temp_conn();
         let hash = InfoHash([12u8; 20]);
-        insert_discovered(&conn, &hash).unwrap();
+        super::super::torrent::insert_discovered(&conn, &hash).unwrap();
         super::super::torrent::mark_blocked(&conn, &hash).unwrap();
 
         let result = process_discovery_batch(&conn, &[(hash, None)]).unwrap();
@@ -149,7 +167,7 @@ mod tests {
     fn discovery_batch_skips_failed_in_backoff() {
         let (_file, conn) = temp_conn();
         let hash = InfoHash([14u8; 20]);
-        insert_discovered(&conn, &hash).unwrap();
+        super::super::torrent::insert_discovered(&conn, &hash).unwrap();
         let future = crate::unix_now() + 3600;
         super::super::torrent::mark_failed(&conn, &hash, future).unwrap();
 

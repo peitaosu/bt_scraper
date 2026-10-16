@@ -1,3 +1,4 @@
+use aho_corasick::AhoCorasick;
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
@@ -24,7 +25,7 @@ pub struct TagRuleConfig {
 }
 
 pub struct ClassificationRules {
-    blocklist: Vec<String>,
+    blocklist: AhoCorasick,
     formats: HashMap<String, Vec<String>>,
     tags: Vec<CompiledTagRule>,
 }
@@ -45,6 +46,15 @@ impl ClassificationRules {
     }
 
     pub fn from_file(file: ClassificationFile) -> Result<Arc<Self>> {
+        let patterns: Vec<String> = file
+            .blocklist
+            .iter()
+            .map(|term| term.to_ascii_lowercase())
+            .collect();
+        let blocklist = AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(&patterns)
+            .context("build blocklist matcher")?;
         let mut tags = Vec::new();
         for rule in file.tags {
             let regex = if let Some(pattern) = rule.regex {
@@ -60,7 +70,7 @@ impl ClassificationRules {
             });
         }
         Ok(Arc::new(Self {
-            blocklist: file.blocklist,
+            blocklist,
             formats: file.formats,
             tags,
         }))
@@ -68,7 +78,7 @@ impl ClassificationRules {
 
     pub fn is_blocked(&self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
-        self.blocklist.iter().any(|term| lower.contains(term))
+        self.blocklist.is_match(&lower)
     }
 
     pub fn detect_content_type(&self, names: &[String]) -> String {

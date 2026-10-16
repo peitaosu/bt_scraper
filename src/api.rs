@@ -104,9 +104,11 @@ pub async fn search(
         }
     }
 
-    let result = state
-        .search
-        .search(&query)
+    let search = state.search.clone();
+    let search_query = query.clone();
+    let result = tokio::task::spawn_blocking(move || search.search(&search_query))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({
         "query": query.q,

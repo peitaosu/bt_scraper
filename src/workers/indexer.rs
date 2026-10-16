@@ -4,7 +4,7 @@ use crate::classify::{classify, Classification};
 use crate::classification_config::ClassificationRules;
 use crate::config::IndexConfig;
 use crate::search::SearchIndex;
-use crate::store::{IndexCandidate, Store};
+use crate::store::{IndexCandidate, IndexMark, Store};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -75,7 +75,7 @@ async fn process_index_batch(
 
     let mut classified = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let classification = classify(&candidate.metadata, rules);
+        let classification = classification_for_candidate(&candidate, rules);
         classified.push((candidate, classification));
     }
 
@@ -88,33 +88,33 @@ async fn process_index_batch(
     if !tantivy_items.is_empty() {
         let search = search.clone();
         let commit_batch = config.commit_batch;
-        tokio::task::spawn_blocking(move || write_tantivy_batch(&search, &tantivy_items, commit_batch))
-            .await
-            .map_err(|_| anyhow::anyhow!("index write task panicked"))??;
+        let reload_on_commit = config.reload_reader_on_commit;
+        tokio::task::spawn_blocking(move || {
+            write_tantivy_batch(&search, &tantivy_items, commit_batch, reload_on_commit)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("index write task panicked"))??;
     }
 
+    let mut marks = Vec::new();
     let mut indexed = 0usize;
     for (candidate, classification) in classified {
         if classification.blocked {
             debug!(hash = %candidate.info_hash, "skipping blocked torrent for index");
-            store
-                .mark_indexed(
-                    &candidate.info_hash,
-                    &classification.content_type,
-                    &classification.tags,
-                )
-                .await?;
+            marks.push(IndexMark {
+                info_hash: candidate.info_hash,
+                content_type: classification.content_type,
+                tags: classification.tags,
+            });
             metrics::counter!("index_skipped_blocked_total").increment(1);
             continue;
         }
 
-        store
-            .mark_indexed(
-                &candidate.info_hash,
-                &classification.content_type,
-                &classification.tags,
-            )
-            .await?;
+        marks.push(IndexMark {
+            info_hash: candidate.info_hash,
+            content_type: classification.content_type.clone(),
+            tags: classification.tags.clone(),
+        });
         backends
             .on_indexed(
                 &candidate.info_hash,
@@ -128,37 +128,58 @@ async fn process_index_batch(
         metrics::counter!("index_success_total").increment(1);
         indexed += 1;
     }
+    store.mark_indexed_batch(marks).await?;
 
     Ok(indexed)
+}
+
+fn classification_for_candidate(
+    candidate: &IndexCandidate,
+    rules: &ClassificationRules,
+) -> Classification {
+    let mut classification = classify(&candidate.metadata, rules);
+    if !classification.blocked {
+        if let Some(content_type) = &candidate.content_type {
+            if !candidate.tags.is_empty() {
+                classification.content_type = content_type.clone();
+                classification.tags = candidate.tags.clone();
+            }
+        }
+    }
+    classification
 }
 
 fn write_tantivy_batch(
     search: &Arc<SearchIndex>,
     items: &[(IndexCandidate, Classification)],
     commit_batch: usize,
+    reload_on_commit: bool,
 ) -> Result<()> {
-    let mut writer = search.writer()?;
     let mut pending_commits = 0usize;
-    for (candidate, classification) in items {
-        search.upsert(
-            &mut writer,
-            &candidate.info_hash,
-            &candidate.metadata,
-            classification,
-            candidate.seeders as u64,
-            candidate.leechers as u64,
-            candidate.enriched_at,
-            candidate.discovered_at,
-        )?;
-        pending_commits += 1;
-        if pending_commits >= commit_batch {
-            writer.commit()?;
-            let _ = search.reload();
-            pending_commits = 0;
+    search.with_writer(|writer| {
+        for (candidate, classification) in items {
+            search.upsert(
+                writer,
+                &candidate.info_hash,
+                &candidate.metadata,
+                classification,
+                candidate.seeders as u64,
+                candidate.leechers as u64,
+                candidate.enriched_at,
+                candidate.discovered_at,
+            )?;
+            pending_commits += 1;
+            if pending_commits >= commit_batch {
+                writer.commit()?;
+                pending_commits = 0;
+            }
         }
-    }
-    if pending_commits > 0 {
-        writer.commit()?;
+        if pending_commits > 0 {
+            writer.commit()?;
+        }
+        Ok(())
+    })?;
+    if reload_on_commit {
         let _ = search.reload();
     }
     Ok(())

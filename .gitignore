@@ -2,4 +2,4 @@
 /data/
 *.db
 *.db-*
-logs/scraper.log
+logs/

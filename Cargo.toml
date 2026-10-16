@@ -14,6 +14,7 @@ name = "bt-scraper"
 path = "src/main.rs"
 
 [dependencies]
+aho-corasick = "1"
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
@@ -23,6 +24,8 @@ mainline = "8"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 rand = "0.8"
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -32,7 +35,7 @@ serde_json = "1"
 sha1 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 tantivy = "0.26"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "signal"] }
 tokio-util = "0.7"
 toml = "0.8"
 tracing = "0.1"

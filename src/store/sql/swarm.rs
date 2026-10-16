@@ -29,8 +29,7 @@ pub fn update_tracker_stats(
         "UPDATE torrents SET
             seeders = ?2,
             leechers = ?3,
-            tracker_at = ?4,
-            indexed_at = NULL
+            tracker_at = ?4
          WHERE info_hash = ?1",
         params![
             info_hash.0.as_slice(),
@@ -73,6 +72,8 @@ mod tests {
                 files: vec![],
                 total_length: 1,
             },
+            None,
+            None,
         )
         .unwrap();
         let now = unix_now();

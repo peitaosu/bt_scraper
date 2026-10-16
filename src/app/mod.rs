@@ -9,16 +9,17 @@ use crate::enrich::{
     run_discovery_batcher, run_enrichment_pool, run_enrichment_scheduler,
     run_failed_requeue_loop, run_peer_prune_loop, DiscoverySettings, EnrichSettings,
 };
-use crate::workers::run_indexer_loop;
+use crate::infra::RuntimeServices;
 use crate::metrics::{init_metrics, register_metrics};
 use crate::ports::DhtPeerLookup;
 use crate::routing::load_routing_table;
-use crate::workers::run_tracker_scrape_loop;
 use crate::search::SearchIndex;
 use crate::store::Store;
+use crate::workers::run_indexer_loop;
+use crate::workers::run_tracker_scrape_loop;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -33,18 +34,26 @@ pub async fn run(config: Config) -> Result<()> {
     let shutdown = CancellationToken::new();
     let worker_cancel = shutdown.child_token();
 
+    let runtime = RuntimeServices::new(
+        config.tracker.http_timeout_secs,
+        config.dht.udp_pool_size,
+    );
+
     let rules = ClassificationRules::load(&config.classification.config_path)?;
     let backends = Arc::new(crate::backends::BackendContext::from_config(&config).await?);
     info!("opening store");
-    let store = Store::open(
-        &config.store.path,
-        config.store.write_batch_size,
-        config.store.write_flush_ms,
+    let store = Store::open_from_config(
+        &config.store,
+        config.enrichment.peer_fail_threshold,
     )?;
     info!("opening search index");
-    let search = Arc::new(SearchIndex::open(&config.index.path)?);
-    let (discovery_tx, discovery_rx) = mpsc::channel(config.enrichment.queue_capacity);
-    let (enrich_tx, enrich_rx) = mpsc::channel(config.enrichment.queue_capacity);
+    let search = Arc::new(SearchIndex::open_with_options(
+        &config.index.path,
+        config.index.writer_heap_mb,
+        config.index.reload_reader_on_commit,
+    )?);
+    let (discovery_tx, discovery_rx) = mpsc::channel(config.discovery_channel_capacity());
+    let (enrich_tx, enrich_rx) = mpsc::channel(config.enrich_channel_capacity());
 
     let persisted = load_routing_table(&config.dht.routing_table_path);
     info!(bind = %config.dht.bind, "starting dht");
@@ -53,6 +62,7 @@ pub async fn run(config: Config) -> Result<()> {
         &config.dht.bootstrap,
         &persisted,
         discovery_tx.clone(),
+        config.dht.lookup_timeout_secs,
     )
     .await?;
 
@@ -62,15 +72,19 @@ pub async fn run(config: Config) -> Result<()> {
     let bep51_interval_secs = config.dht.bep51_interval_secs;
     let bep51_batch = config.dht.bep51_batch;
     let bep51_concurrency = config.dht.bep51_concurrency;
+    let bep51_sample_timeout_secs = config.dht.bep51_sample_timeout_secs;
+    let udp = runtime.udp.clone();
     tokio::spawn(async move {
         dht_bootstrap.wait_bootstrapped().await;
         run_bep51_sampler(
             async_dht,
             discovery_tx,
             dht_bootstrap.sample_store(),
+            udp,
             bep51_interval_secs,
             bep51_batch,
             bep51_concurrency,
+            bep51_sample_timeout_secs,
             cancel,
         )
         .await;
@@ -105,26 +119,36 @@ pub async fn run(config: Config) -> Result<()> {
         concurrency: config.enrichment.concurrency,
         peers_per_hash: config.enrichment.peers_per_hash,
         peer_timeout_secs: config.enrichment.peer_timeout_secs,
+        connect_timeout_secs: config.enrichment.connect_timeout_secs,
         retry_base_secs: config.enrichment.retry_base_secs,
         retry_max_secs: config.enrichment.retry_max_secs,
         retry_max_attempts: config.enrichment.retry_max_attempts,
         tracker_peer_urls: config.tracker.peer_urls().to_vec(),
         rules: rules.clone(),
+        skip_dht_if_cached_peers: config.enrichment.skip_dht_if_cached_peers,
+        tracker_urls_per_lookup: config.enrichment.tracker_urls_per_lookup,
+        peer_fail_threshold: config.enrichment.peer_fail_threshold,
     };
+    let tcp_limit = Arc::new(Semaphore::new(config.enrichment.global_tcp_limit.max(1)));
     let dht_peers: Arc<dyn DhtPeerLookup> = dht.clone();
     tokio::spawn(run_enrichment_pool(
         enrich_rx,
         store.clone(),
         dht_peers.clone(),
+        runtime.trackers.clone(),
         enrichment_settings.clone(),
+        tcp_limit,
     ));
     tokio::spawn(run_enrichment_scheduler(
         store.clone(),
         dht_peers,
+        runtime.trackers.clone(),
         enrich_tx,
         enrichment_settings,
         config.enrichment.retry_poll_interval_secs,
         config.enrichment.scheduler_batch,
+        config.enrichment.scheduler_lookup_concurrency,
+        config.enrichment.scheduler_batch_max,
         worker_cancel.clone(),
     ));
     tokio::spawn(run_failed_requeue_loop(
@@ -152,48 +176,46 @@ pub async fn run(config: Config) -> Result<()> {
 
     tokio::spawn(run_tracker_scrape_loop(
         store.clone(),
+        search.clone(),
+        runtime.trackers.clone(),
         config.tracker.clone(),
+        config.index.patch_swarm_on_scrape,
         worker_cancel.clone(),
     ));
 
     let store_stats = store.clone();
     let stats_cancel = worker_cancel.clone();
+    let stats_interval_secs = config.enrichment.stats_interval_secs;
     tokio::spawn(async move {
         loop {
             if stats_cancel.is_cancelled() {
                 return;
             }
-            if let Ok((total, enriched, pending)) = store_stats.count_by_status().await {
-                let indexed = store_stats.count_indexed().await.unwrap_or(0);
-                let retry_depth = store_stats
-                    .count_retry_queue(crate::unix_now())
-                    .await
-                    .unwrap_or(0);
-                let peers = store_stats.peer_breakdown().await.unwrap_or_default();
-                let torrents = store_stats.torrent_breakdown().await.unwrap_or_default();
-                metrics::gauge!("retry_queue_depth").set(retry_depth as f64);
-                metrics::gauge!("pipeline_enriched").set(enriched as f64);
-                metrics::gauge!("pipeline_pending").set(pending as f64);
-                metrics::gauge!("pipeline_indexed").set(indexed as f64);
+            let now = crate::unix_now();
+            if let Ok(snapshot) = store_stats.pipeline_snapshot(now).await {
+                metrics::gauge!("retry_queue_depth").set(snapshot.retry_queue as f64);
+                metrics::gauge!("pipeline_enriched").set(snapshot.enriched as f64);
+                metrics::gauge!("pipeline_pending").set(snapshot.pending as f64);
+                metrics::gauge!("pipeline_indexed").set(snapshot.indexed as f64);
                 info!(
-                    total,
-                    enriched,
-                    pending,
-                    indexed,
-                    retry_depth,
-                    peers_announce = peers.announce,
-                    peers_dht = peers.dht,
-                    peers_tracker = peers.tracker,
-                    status_discovered = torrents.discovered,
-                    status_enriching = torrents.enriching,
-                    status_failed = torrents.failed,
-                    status_blocked = torrents.blocked,
+                    total = snapshot.total,
+                    enriched = snapshot.enriched,
+                    pending = snapshot.pending,
+                    indexed = snapshot.indexed,
+                    retry_depth = snapshot.retry_queue,
+                    peers_announce = snapshot.peers.announce,
+                    peers_dht = snapshot.peers.dht,
+                    peers_tracker = snapshot.peers.tracker,
+                    status_discovered = snapshot.torrents.discovered,
+                    status_enriching = snapshot.torrents.enriching,
+                    status_failed = snapshot.torrents.failed,
+                    status_blocked = snapshot.torrents.blocked,
                     "stats"
                 );
             }
             tokio::select! {
                 _ = stats_cancel.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(stats_interval_secs)) => {}
             }
         }
     });

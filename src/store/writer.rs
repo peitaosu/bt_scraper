@@ -1,6 +1,8 @@
 use super::sql;
+use super::sql::IndexMark;
 use crate::{InfoHash, Peer, TorrentMetadata};
 use anyhow::{Context, Result};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
@@ -15,12 +17,18 @@ pub enum WriteOp {
         info_hash: InfoHash,
         peers: Vec<Peer>,
     },
+    RecordPeerFailures {
+        info_hash: InfoHash,
+        addrs: Vec<SocketAddr>,
+    },
     MarkEnriching {
         info_hash: InfoHash,
     },
     SaveEnriched {
         info_hash: InfoHash,
         metadata: TorrentMetadata,
+        content_type: Option<String>,
+        tags_json: Option<String>,
     },
     MarkFailed {
         info_hash: InfoHash,
@@ -33,6 +41,9 @@ pub enum WriteOp {
         info_hash: InfoHash,
         content_type: String,
         tags: Vec<String>,
+    },
+    MarkIndexedBatch {
+        marks: Vec<IndexMark>,
     },
     UpdateTrackerStatsBatch {
         updates: Vec<(InfoHash, u32, u32, u64)>,
@@ -68,11 +79,16 @@ pub struct StoreWriter {
 }
 
 impl StoreWriter {
-    pub fn spawn(path: PathBuf, batch_size: usize, flush_ms: u64) -> Result<Self> {
+    pub fn spawn(
+        path: PathBuf,
+        batch_size: usize,
+        flush_ms: u64,
+        pragmas: sql::SqlitePragmas,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("store-writer".into())
-            .spawn(move || writer_loop(path, rx, batch_size, flush_ms.max(1)))
+            .spawn(move || writer_loop(path, rx, batch_size, flush_ms.max(1), pragmas))
             .context("spawn store writer thread")?;
         Ok(Self { _join: join, tx })
     }
@@ -103,8 +119,9 @@ fn writer_loop(
     rx: mpsc::Receiver<WriteRequest>,
     batch_size: usize,
     flush_ms: u64,
+    pragmas: sql::SqlitePragmas,
 ) {
-    let conn = match sql::open_write(&path) {
+    let conn = match sql::open_write_with_pragmas(&path, &pragmas) {
         Ok(conn) => conn,
         Err(error) => {
             tracing::error!(%error, "store writer failed to open database");
@@ -162,9 +179,32 @@ fn flush_deferred(conn: &rusqlite::Connection, deferred: &mut Vec<WriteRequest>)
         return;
     }
     let batch: Vec<WriteRequest> = deferred.drain(..).collect();
+    let mut indexed_batch: Vec<IndexMark> = Vec::new();
     for req in batch {
+        if let WriteOp::MarkIndexedBatch { marks } = req.op {
+            indexed_batch.extend(marks);
+            continue;
+        }
+        if let WriteOp::MarkIndexed {
+            info_hash,
+            content_type,
+            tags,
+        } = req.op
+        {
+            indexed_batch.push(IndexMark {
+                info_hash,
+                content_type,
+                tags,
+            });
+            continue;
+        }
         if let Err(error) = execute_op(conn, req.op) {
             tracing::warn!(%error, "deferred store write failed");
+        }
+    }
+    if !indexed_batch.is_empty() {
+        if let Err(error) = sql::mark_indexed_batch(conn, &indexed_batch) {
+            tracing::warn!(%error, "deferred index mark batch failed");
         }
     }
 }
@@ -179,12 +219,27 @@ fn execute_op(conn: &rusqlite::Connection, op: WriteOp) -> Result<WriteReply> {
             sql::upsert_peers(conn, &info_hash, &peers)?;
             Ok(WriteReply::Unit)
         }
+        WriteOp::RecordPeerFailures { info_hash, addrs } => {
+            sql::record_peer_failures(conn, &info_hash, &addrs)?;
+            Ok(WriteReply::Unit)
+        }
         WriteOp::MarkEnriching { info_hash } => {
             sql::mark_enriching(conn, &info_hash)?;
             Ok(WriteReply::Unit)
         }
-        WriteOp::SaveEnriched { info_hash, metadata } => {
-            sql::save_enriched(conn, &info_hash, &metadata)?;
+        WriteOp::SaveEnriched {
+            info_hash,
+            metadata,
+            content_type,
+            tags_json,
+        } => {
+            sql::save_enriched(
+                conn,
+                &info_hash,
+                &metadata,
+                content_type.as_deref(),
+                tags_json.as_deref(),
+            )?;
             Ok(WriteReply::Unit)
         }
         WriteOp::MarkFailed { info_hash, next_retry_at } => {
@@ -201,6 +256,10 @@ fn execute_op(conn: &rusqlite::Connection, op: WriteOp) -> Result<WriteReply> {
             tags,
         } => {
             sql::mark_indexed(conn, &info_hash, &content_type, &tags)?;
+            Ok(WriteReply::Unit)
+        }
+        WriteOp::MarkIndexedBatch { marks } => {
+            sql::mark_indexed_batch(conn, &marks)?;
             Ok(WriteReply::Unit)
         }
         WriteOp::UpdateTrackerStatsBatch { updates } => {

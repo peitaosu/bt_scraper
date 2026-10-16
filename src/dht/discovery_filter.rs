@@ -29,7 +29,7 @@ impl DiscoveryFilter {
         if let Ok(mut store) = self.sample_store.lock() {
             store.record(event.info_hash);
         }
-        if self.discovery_tx.blocking_send(event).is_err() {
+        if self.discovery_tx.try_send(event).is_err() {
             metrics::counter!("discovery_dropped_total").increment(1);
             debug!("discovery channel full, event dropped");
         }

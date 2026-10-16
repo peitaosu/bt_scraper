@@ -10,11 +10,7 @@ use std::sync::Arc;
 
 pub async fn stats(config_path: &PathBuf) -> Result<()> {
     let config = Config::load(config_path)?;
-    let store = Store::open(
-        &config.store.path,
-        config.store.write_batch_size,
-        config.store.write_flush_ms,
-    )?;
+    let store = Store::open_from_config(&config.store, config.enrichment.peer_fail_threshold)?;
     let (total, enriched, pending) = store.count_by_status().await?;
     let indexed = store.count_indexed().await?;
     let payload = serde_json::json!({
@@ -29,11 +25,7 @@ pub async fn stats(config_path: &PathBuf) -> Result<()> {
 
 pub async fn backfill(config_path: &PathBuf) -> Result<()> {
     let config = Config::load(config_path)?;
-    let store = Store::open(
-        &config.store.path,
-        config.store.write_batch_size,
-        config.store.write_flush_ms,
-    )?;
+    let store = Store::open_from_config(&config.store, config.enrichment.peer_fail_threshold)?;
     let count = store.clear_all_indexed_flags().await?;
     println!("cleared indexed_at on {count} torrents");
     Ok(())
@@ -41,13 +33,13 @@ pub async fn backfill(config_path: &PathBuf) -> Result<()> {
 
 pub async fn reindex(config_path: &PathBuf) -> Result<()> {
     let config = Config::load(config_path)?;
-    let store = Store::open(
-        &config.store.path,
-        config.store.write_batch_size,
-        config.store.write_flush_ms,
-    )?;
+    let store = Store::open_from_config(&config.store, config.enrichment.peer_fail_threshold)?;
     store.clear_all_indexed_flags().await?;
-    let search = Arc::new(SearchIndex::open(&config.index.path)?);
+    let search = Arc::new(SearchIndex::open_with_options(
+        &config.index.path,
+        config.index.writer_heap_mb,
+        config.index.reload_reader_on_commit,
+    )?);
     let rules = ClassificationRules::load(&config.classification.config_path)?;
     let backends = crate::backends::BackendContext::from_config(&config).await?;
     let indexed = index_batch(&store, &search, &rules, &backends, &config.index, usize::MAX).await?;
@@ -57,11 +49,7 @@ pub async fn reindex(config_path: &PathBuf) -> Result<()> {
 
 pub async fn export(config_path: &PathBuf, output: &PathBuf) -> Result<()> {
     let config = Config::load(config_path)?;
-    let store = Store::open(
-        &config.store.path,
-        config.store.write_batch_size,
-        config.store.write_flush_ms,
-    )?;
+    let store = Store::open_from_config(&config.store, config.enrichment.peer_fail_threshold)?;
     let rules = ClassificationRules::load(&config.classification.config_path)?;
     let mut file = std::fs::File::create(output).context("create export file")?;
     use std::io::Write;
@@ -78,8 +66,7 @@ pub async fn export(config_path: &PathBuf, output: &PathBuf) -> Result<()> {
             "tags": classification.tags,
             "seeders": record.seeders,
             "leechers": record.leechers,
-            "total_length": metadata.total_length,
-            "files": metadata.files,
+            "discovered_at": record.discovered_at,
             "enriched_at": record.enriched_at,
         });
         writeln!(file, "{}", line)?;

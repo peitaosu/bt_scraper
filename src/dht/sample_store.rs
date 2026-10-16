@@ -1,12 +1,13 @@
 use crate::InfoHash;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 const DEFAULT_MAX: usize = 2000;
 const DEFAULT_INTERVAL_SECS: u64 = 60;
 const MAX_SAMPLE_REPLY: usize = 20;
 
 pub struct SampleStore {
-    hashes: VecDeque<InfoHash>,
+    order: VecDeque<InfoHash>,
+    index: HashSet<InfoHash>,
     max: usize,
     interval_secs: u64,
 }
@@ -14,7 +15,8 @@ pub struct SampleStore {
 impl SampleStore {
     pub fn new(max: usize) -> Self {
         Self {
-            hashes: VecDeque::new(),
+            order: VecDeque::new(),
+            index: HashSet::new(),
             max: max.max(1),
             interval_secs: DEFAULT_INTERVAL_SECS,
         }
@@ -25,17 +27,19 @@ impl SampleStore {
     }
 
     pub fn record(&mut self, info_hash: InfoHash) {
-        if self.hashes.iter().any(|existing| existing == &info_hash) {
+        if !self.index.insert(info_hash) {
             return;
         }
-        if self.hashes.len() >= self.max {
-            self.hashes.pop_front();
+        if self.order.len() >= self.max {
+            if let Some(removed) = self.order.pop_front() {
+                self.index.remove(&removed);
+            }
         }
-        self.hashes.push_back(info_hash);
+        self.order.push_back(info_hash);
     }
 
     pub fn count(&self) -> usize {
-        self.hashes.len()
+        self.order.len()
     }
 
     pub fn interval_secs(&self) -> u64 {
@@ -43,19 +47,19 @@ impl SampleStore {
     }
 
     pub fn random_sample(&self, limit: usize) -> Vec<InfoHash> {
-        let limit = limit.min(MAX_SAMPLE_REPLY).min(self.hashes.len());
+        let limit = limit.min(MAX_SAMPLE_REPLY).min(self.order.len());
         if limit == 0 {
             return Vec::new();
         }
-        let mut indices: Vec<usize> = (0..self.hashes.len()).collect();
+        let mut indices: Vec<usize> = (0..self.order.len()).collect();
         for slot in 0..limit {
-            let swap_with = rand::random::<usize>() % self.hashes.len();
+            let swap_with = rand::random::<usize>() % self.order.len();
             indices.swap(slot, swap_with);
         }
         indices
             .into_iter()
             .take(limit)
-            .filter_map(|index| self.hashes.get(index).copied())
+            .filter_map(|index| self.order.get(index).copied())
             .collect()
     }
 }

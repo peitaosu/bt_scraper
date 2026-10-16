@@ -1,5 +1,6 @@
 use super::krpc::{sample_infohashes_timeout, SampleInfohashesResponse};
 use super::sample_store::SampleStore;
+use crate::infra::UdpPool;
 use crate::{DiscoveredHash, DiscoverySource, InfoHash};
 use anyhow::Result;
 use std::collections::HashSet;
@@ -17,9 +18,11 @@ pub async fn run_bep51_sampler(
     dht: Arc<AsyncDht>,
     discovery_tx: mpsc::Sender<DiscoveredHash>,
     sample_store: Arc<Mutex<SampleStore>>,
+    udp: UdpPool,
     interval_secs: u64,
     batch: usize,
     concurrency: usize,
+    sample_timeout_secs: u64,
     cancel: CancellationToken,
 ) {
     let mut target = Id::random();
@@ -59,11 +62,14 @@ pub async fn run_bep51_sampler(
                     }
                 }
             }
+            let udp = udp.clone();
+            let sample_timeout = Duration::from_secs(sample_timeout_secs.max(1));
             set.spawn(async move {
                 sample_from_node(
                     SocketAddr::V4(addr),
                     target,
-                    Duration::from_secs(8),
+                    sample_timeout,
+                    &udp,
                 )
                 .await
                 .map(|response| (addr, response))
@@ -94,9 +100,10 @@ async fn sample_from_node(
     addr: SocketAddr,
     target: Id,
     sample_timeout: Duration,
+    udp: &UdpPool,
 ) -> Result<SampleInfohashesResponse, anyhow::Error> {
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-    sample_infohashes_timeout(&socket, addr, target, sample_timeout).await
+    let lease = udp.acquire().await?;
+    sample_infohashes_timeout(&lease.socket, addr, target, sample_timeout).await
 }
 
 async fn apply_sample_result(
@@ -115,14 +122,14 @@ async fn apply_sample_result(
                     store.record(hash);
                 }
                 if discovery_tx
-                    .send(DiscoveredHash {
+                    .try_send(DiscoveredHash {
                         info_hash: hash,
                         peer: None,
                         source: DiscoverySource::Bep51,
                     })
-                    .await
                     .is_err()
                 {
+                    metrics::counter!("discovery_dropped_total").increment(1);
                     return;
                 }
             }
@@ -185,7 +192,10 @@ pub async fn discover_sample_hashes(
                 }
             }
             let sample_target = target;
-            set.spawn(async move { sample_from_node(addr, sample_target, attempt_timeout).await });
+            set.spawn(async move {
+                let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+                sample_infohashes_timeout(&socket, addr, sample_target, attempt_timeout).await
+            });
         }
         while let Some(join_result) = set.join_next().await {
             if let Ok(sample_result) = join_result {
